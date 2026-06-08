@@ -1609,7 +1609,7 @@ function PriceList(){
       for(const s of p.subproducts){
         if(!(s.priceListSegments||[]).includes(seg)) continue;
         const vatMult=1+s.vatPercent/100;
-        const stored=s.segments[seg].chosenPriceInclBtw; // excl. for B2B
+        const stored=s.segments[seg].chosenPriceInclBtw;
         const consumerPriceIncl=s.segments.consumenten.chosenPriceInclBtw;
         let rd=null, priceExcl=null, priceForCalc=null;
         if(seg==='consumenten'){
@@ -1626,9 +1626,25 @@ function PriceList(){
         }
         const bd=priceForCalc?calcBreakdown(s,seg,state.config,priceForCalc):null;
         const variantLabel=`${s.name} (${Math.round(s.weight*1000)}g)`;
-        out.push({prod:p.name,variant:variantLabel,priceExcl,priceIncl:seg==='consumenten'?stored:null,bd,vatMult,weight:s.weight,rd,consumerPriceIncl});
+        // Categorisering: gebruik alle types/diersoorten; wijs toe aan elk type × diersoort
+        const productTypes=(p.productTypes||[]).length?(p.productTypes):['Overig'];
+        const animalTypes=(p.animalTypes||[]).length?(p.animalTypes):['Onbekend'];
+        for(const pt of productTypes){
+          for(const at of animalTypes){
+            out.push({prod:p.name,variant:variantLabel,priceExcl,priceIncl:seg==='consumenten'?stored:null,
+              bd,vatMult,weight:s.weight,rd,consumerPriceIncl,productType:pt,animalType:at});
+          }
+        }
       }
     }
+    // Sorteer: productType → animalType → productnaam
+    out.sort((a,b)=>{
+      const ptCmp=a.productType.localeCompare(b.productType,'nl');
+      if(ptCmp!==0) return ptCmp;
+      const atCmp=a.animalType.localeCompare(b.animalType,'nl');
+      if(atCmp!==0) return atCmp;
+      return a.prod.localeCompare(b.prod,'nl');
+    });
     return out;
   },[state.products,state.config,seg]);
 
@@ -1638,33 +1654,69 @@ function PriceList(){
   const TH=({children,right})=><th className={`px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide ${right?'text-right':'text-left'}`}>{children}</th>;
   const TD=({children,right,bold})=><td className={`px-4 py-3 ${right?'text-right font-mono':''}${bold?' font-semibold':''}`}>{children||'—'}</td>;
 
+  const colCount = seg==='consumenten'?4:seg==='horeca'?3:5;
+
   const renderHeaders=()=>{
     if(seg==='consumenten') return <><TH>Product</TH><TH>Variant</TH><TH right>Prijs incl. BTW</TH><TH right>Kiloprijs incl. BTW</TH></>;
     if(seg==='horeca')      return <><TH>Product</TH><TH>Variant</TH><TH right>Kiloprijs excl. BTW</TH></>;
     if(seg==='retail')      return <><TH>Product</TH><TH>Variant</TH><TH right>Stuksprijs excl. BTW</TH><TH right>Adviesprijs incl. BTW</TH><TH right>Marge retailer</TH></>;
   };
+
   const renderRow=(r,i)=>{
-    if(seg==='consumenten') return <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
-      <TD bold>{r.prod}</TD>
-      <TD>{r.variant}</TD>
+    if(seg==='consumenten') return <tr key={`r-${i}`} className="border-t border-gray-100 hover:bg-gray-50">
+      <TD bold>{r.prod}</TD><TD>{r.variant}</TD>
       <TD right bold>{r.priceIncl?eur(r.priceIncl):'—'}</TD>
       <TD right>{r.bd?eur(r.bd.pkgPerKgIncl):'—'}</TD>
     </tr>;
-    if(seg==='horeca') return <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
-      <TD bold>{r.prod}</TD>
-      <TD>{r.variant}</TD>
+    if(seg==='horeca') return <tr key={`r-${i}`} className="border-t border-gray-100 hover:bg-gray-50">
+      <TD bold>{r.prod}</TD><TD>{r.variant}</TD>
       <TD right bold>{r.priceExcl?eur(r.priceExcl/r.weight):'—'}</TD>
     </tr>;
     if(seg==='retail'){
       const retailerMargin=r.rd?.retailerMarginActual;
-      return <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
-        <TD bold>{r.prod}</TD>
-        <TD>{r.variant}</TD>
+      return <tr key={`r-${i}`} className="border-t border-gray-100 hover:bg-gray-50">
+        <TD bold>{r.prod}</TD><TD>{r.variant}</TD>
         <TD right bold>{r.priceExcl?eur(r.priceExcl):'—'}</TD>
         <TD right>{r.consumerPriceIncl?eur(r.consumerPriceIncl):'—'}</TD>
         <TD right>{retailerMargin!=null?pct(retailerMargin):'—'}</TD>
       </tr>;
     }
+  };
+
+  // Bouw rijen inclusief groepkoppen
+  const renderTableBody=()=>{
+    if(!rows.length) return <tr><td colSpan={colCount} className="text-center text-gray-400 py-10">
+      Geen producten op de {SEG_LABELS[seg]}-prijslijst
+    </td></tr>;
+
+    const result=[];
+    let lastPt=null, lastAt=null;
+    rows.forEach((r,i)=>{
+      // Producttype-kop (niveau 1)
+      if(r.productType!==lastPt){
+        result.push(
+          <tr key={`pt-${r.productType}`} className="bg-green-900">
+            <td colSpan={colCount} className="px-4 py-2 text-sm font-bold text-white uppercase tracking-wide">
+              {r.productType}
+            </td>
+          </tr>
+        );
+        lastPt=r.productType; lastAt=null; // reset diersoort bij nieuw type
+      }
+      // Diersoort-kop (niveau 2)
+      if(r.animalType!==lastAt){
+        result.push(
+          <tr key={`at-${r.productType}-${r.animalType}`} className="bg-green-50">
+            <td colSpan={colCount} className="px-4 py-1.5 text-xs font-semibold text-green-800 uppercase tracking-wider">
+              {r.animalType}
+            </td>
+          </tr>
+        );
+        lastAt=r.animalType;
+      }
+      result.push(renderRow(r,i));
+    });
+    return result;
   };
 
   return <div className="space-y-5">
@@ -1702,19 +1754,12 @@ function PriceList(){
       })}
     </div>
 
-    {rows.length===0?(
-      <div className="bg-white rounded-xl border border-gray-200 p-12 text-center text-gray-400">
-        <p className="text-lg mb-2">Geen producten op de {SEG_LABELS[seg]}-prijslijst</p>
-        <p className="text-sm">Ga naar een product en vink bij "Prijslijst" het segment aan.</p>
-      </div>
-    ):(
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50"><tr>{renderHeaders()}</tr></thead>
-          <tbody>{rows.map((r,i)=>renderRow(r,i))}</tbody>
-        </table>
-      </div>
-    )}
+    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50"><tr>{renderHeaders()}</tr></thead>
+        <tbody>{renderTableBody()}</tbody>
+      </table>
+    </div>
   </div>;
 }
 
