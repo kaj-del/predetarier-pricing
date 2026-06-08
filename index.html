@@ -1,0 +1,1763 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>De Predetariër — Pricing</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <style>
+    body { font-family: system-ui,-apple-system,sans-serif; background:#f9fafb; }
+    .fade { animation: fi .15s ease; }
+    @keyframes fi { from{opacity:0;transform:translateY(3px)} to{opacity:1;transform:none} }
+    input[type=number]::-webkit-inner-spin-button { opacity:1; }
+    .inp { border:1px solid #d1d5db; border-radius:.5rem; padding:.375rem .625rem; font-size:.875rem; background:#fff; outline:none; transition:box-shadow .15s; }
+    .inp:focus { box-shadow:0 0 0 2px #16a34a44; border-color:#16a34a; }
+    @media print {
+      aside, .print\:hidden { display:none!important; }
+      main { overflow:visible; }
+      body { background:#fff; font-size:12px; }
+      .space-y-5 > * { margin-bottom:12px; }
+      table { border-collapse:collapse; width:100%; }
+      th, td { border-bottom:1px solid #e5e7eb; padding:8px 12px; }
+      thead { background:#f9fafb!important; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+      .bg-white { background:#fff!important; }
+      .rounded-xl, .border { border-radius:0!important; }
+      @page { margin:2cm; }
+    }
+  </style>
+</head>
+<body><div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useReducer, createContext, useContext, useMemo, useRef, useCallback } = React;
+
+// ── CONSTANTS ──────────────────────────────────────────────────────────────
+const ANIMAL_TYPES = ['Ree','Hert','Wild Zwijn','Grofwild','Gevogelte','Kleinwild','Haas','Gans','Eend','Duif','Konijn','Fazant','Mix'];
+const PRODUCT_TYPES = ['Vers vlees','Kant-en-klaar','Worst','Charcuterie','Delicatessen','Broodjes','Dranken'];
+const PKG_OPTIONS = { consumenten:['kopkaart','wikkel','vierkantLabel','rechthoekigLabel','geen'], retail:['kopkaart','wikkel','vierkantLabel','rechthoekigLabel','geen'], horeca:['sticker','geen'] };
+const PKG_LABELS = { kopkaart:'Kopkaart', wikkel:'Wikkel', vierkantLabel:'Vierkant label', rechthoekigLabel:'Rechthoekig label', sticker:'Sticker', geen:'Geen' };
+const SEGS = ['consumenten','retail','horeca'];
+const SEG_LABELS = { consumenten:'Consumenten', retail:'Retail', horeca:'Horeca' };
+
+const DEFAULT_CONFIG = {
+  costs: {
+    packaging: { kopkaart:0.35, wikkel:0.25, vierkantLabel:0.10, rechthoekigLabel:0.10, sticker:0.05, geen:0 },
+    handlingHourlyRate: 25,
+    // labeling = directe kost per eenheid → GM2
+    // verzending = aandeel orderwaarde → GM3
+    handlingMinutes: {
+      consumenten: { labeling:5, verzending:3 },
+      retail:      { labeling:3, verzending:2 },
+      horeca:      { labeling:2, verzending:1 }
+    },
+    transactionCostPercent: 2.5,
+    storageCostPerUnit: 0.15
+  },
+  segments: {
+    consumenten: { label:'Consumenten', avgOrderValue:150, freeShippingFrom:200, shippingCost:6.95, deliveryFee:9.95, targetMarginMin:0.30 },
+    retail:      { label:'Retail',      avgOrderValue:500, freeShippingFrom:300, shippingCost:15.00, deliveryFee:0,    retailerMargin:0.35, minOwnMargin:0.15 },
+    horeca:      { label:'Horeca',      avgOrderValue:350, freeShippingFrom:150, shippingCost:10.00, deliveryFee:0,    targetMargin:0.30 }
+    // deliveryFee altijd beschikbaar per segment — ook horeca
+  },
+  googleDrive: { clientId:'', lastBackup:null }
+};
+
+const mkSub = () => ({
+  id: crypto.randomUUID(), name:'',
+  suppliers: [{ id: crypto.randomUUID(), name:'', pricePerUnit:0, unit:'kg', active:true }],
+  purchasePricePerUnit: 0, purchaseUnit:'kg', weight:1, vatPercent:9,
+  priceListSegments: [],
+  activeSegments: ['consumenten','retail','horeca'], // welke kanalen van toepassing zijn
+  segments: {
+    consumenten: { packagingType:'kopkaart', chosenPriceInclBtw:null, competitorPrices:[], disabledCosts:[] },
+    retail:      { packagingType:'wikkel',   chosenPriceInclBtw:null, disabledCosts:[] },
+    horeca:      { packagingType:'sticker',  chosenPriceInclBtw:null, disabledCosts:[] }
+  }
+});
+
+const mkCompetitor = () => ({ id: crypto.randomUUID(), name:'', price:0, url:'' });
+
+const DEMO = [
+  { id:'d1', name:'Hertenbiefstuk', animalTypes:['Hert'], productTypes:['Vers vlees'], subproducts:[
+    { id:'d1a', name:'Per kilo', priceListSegments:['consumenten'], suppliers:[{id:'s1',name:'Leverancier A',pricePerUnit:18,unit:'kg',active:true}], purchasePricePerUnit:18, purchaseUnit:'kg', weight:1, vatPercent:9,
+      segments:{ consumenten:{packagingType:'kopkaart',chosenPriceInclBtw:42.95,competitorPrices:[{id:'c1',name:'Slager De Vries',price:44,url:''},{id:'c2',name:'Wildhandel Noord',price:40,url:''}]}, retail:{packagingType:'wikkel',chosenPriceInclBtw:null}, horeca:{packagingType:'sticker',chosenPriceInclBtw:null} } },
+    { id:'d1b', name:'2x 180g', priceListSegments:[], suppliers:[{id:'s2',name:'Leverancier A',pricePerUnit:18,unit:'kg',active:true}], purchasePricePerUnit:18, purchaseUnit:'kg', weight:0.36, vatPercent:9,
+      segments:{ consumenten:{packagingType:'kopkaart',chosenPriceInclBtw:16.95,competitorPrices:[{id:'c3',name:'AH',price:17.50,url:''}]}, retail:{packagingType:'kopkaart',chosenPriceInclBtw:null}, horeca:{packagingType:'sticker',chosenPriceInclBtw:null} } }
+  ]},
+  { id:'d2', name:'Wild Zwijn Salami', animalTypes:['Wild Zwijn'], productTypes:['Worst','Charcuterie'], subproducts:[
+    { id:'d2a', name:'Heel ±300g', priceListSegments:[], suppliers:[{id:'s3',name:'Charcuterie Maas',pricePerUnit:12,unit:'kg',active:true}], purchasePricePerUnit:12, purchaseUnit:'kg', weight:0.3, vatPercent:9,
+      segments:{ consumenten:{packagingType:'wikkel',chosenPriceInclBtw:8.95,competitorPrices:[{id:'c4',name:'Deli Shop',price:9.50,url:''}]}, retail:{packagingType:'wikkel',chosenPriceInclBtw:null}, horeca:{packagingType:'geen',chosenPriceInclBtw:null} } }
+  ]}
+];
+
+// ── PRICING UTILS ──────────────────────────────────────────────────────────
+function activePurchaseCost(sub) {
+  const active = (sub.suppliers||[]).find(s=>s.active);
+  const pricePerUnit = active ? active.pricePerUnit : sub.purchasePricePerUnit;
+  const unit = active ? active.unit : sub.purchaseUnit;
+  return unit==='kg' ? pricePerUnit * sub.weight : pricePerUnit;
+}
+
+function shippingShare(priceIncl, segCfg, vatMult) {
+  const {avgOrderValue,freeShippingFrom,shippingCost,deliveryFee=0} = segCfg;
+  if (freeShippingFrom>0 && avgOrderValue>=freeShippingFrom) return 0;
+  return Math.max(0, (priceIncl/avgOrderValue) * (shippingCost - deliveryFee/vatMult));
+}
+
+function calcBreakdown(sub, segName, cfg, priceIncl, overrideWeight) {
+  if (!priceIncl||priceIncl<=0) return null;
+  const weight = overrideWeight ?? sub.weight;
+  const vatMult = 1+sub.vatPercent/100;
+  const priceExcl = priceIncl/vatMult;
+  const segCfg = cfg.segments[segName];
+  const segData = sub.segments[segName];
+  const inkoop = (() => {
+    const active = (sub.suppliers||[]).find(s=>s.active);
+    const p = active ? active.pricePerUnit : sub.purchasePricePerUnit;
+    const u = active ? active.unit : sub.purchaseUnit;
+    return u==='kg' ? p*weight : p;
+  })();
+  const dc = new Set(segData.disabledCosts||[]);
+  const verpakking = cfg.costs.packaging[segData.packagingType]??0;
+  const transRate = cfg.costs.transactionCostPercent/100;
+  const transactie = dc.has('transactie') ? 0 : priceExcl*transRate;
+  const opslag = dc.has('opslag') ? 0 : cfg.costs.storageCostPerUnit;
+  const hm = cfg.costs.handlingMinutes[segName] ?? {};
+  const labelingMins = typeof hm === 'object' ? (hm.labeling??0) : hm;
+  const verzendingMins = typeof hm === 'object' ? (hm.verzending??0) : 0;
+  const rate = cfg.costs.handlingHourlyRate;
+  // Labeling: directe kost per eenheid (→ GM2)
+  const handlingLabeling = dc.has('handlingLabeling') ? 0 : (labelingMins/60) * rate;
+  // Verzending handling: aandeel orderwaarde (→ GM3)
+  const handlingVerzending = dc.has('handlingVerzending') ? 0 : (verzendingMins/60) * (priceIncl/segCfg.avgOrderValue) * rate;
+  const verzend = dc.has('verzend') ? 0 : shippingShare(priceIncl, segCfg, vatMult);
+  const gm1=priceExcl-inkoop;
+  const gm2=gm1-verpakking-transactie-opslag-handlingLabeling;
+  const gm3=gm2-verzend-handlingVerzending;
+  const p=v=>priceExcl>0?v/priceExcl:0;
+  return { priceExcl,priceIncl,inkoop,verpakking,transactie,opslag,handlingLabeling,handlingVerzending,verzend,
+    gm1,gm2,gm3, gm1Pct:p(gm1),gm2Pct:p(gm2),gm3Pct:p(gm3),
+    pkgPerKgExcl:weight>0?priceExcl/weight:priceExcl, pkgPerKgIncl:weight>0?priceIncl/weight:priceIncl,
+    disabledCosts: segData.disabledCosts||[] };
+}
+
+function calcMinPrice(sub, segName, cfg, targetGm3, overrideWeight) {
+  const weight = overrideWeight ?? sub.weight;
+  const vatMult = 1+sub.vatPercent/100;
+  const segCfg = cfg.segments[segName];
+  const segData = sub.segments[segName];
+  const transRate = cfg.costs.transactionCostPercent/100;
+  const inkoop = (() => {
+    const active = (sub.suppliers||[]).find(s=>s.active);
+    const p = active ? active.pricePerUnit : sub.purchasePricePerUnit;
+    const u = active ? active.unit : sub.purchaseUnit;
+    return u==='kg' ? p*weight : p;
+  })();
+  const dc2 = new Set(segData.disabledCosts||[]);
+  const verpakking = cfg.costs.packaging[segData.packagingType]??0;
+  const opslag = dc2.has('opslag') ? 0 : cfg.costs.storageCostPerUnit;
+  const hm = cfg.costs.handlingMinutes[segName] ?? {};
+  const labelingMins = typeof hm === 'object' ? (hm.labeling??0) : hm;
+  const verzendingMins = typeof hm === 'object' ? (hm.verzending??0) : 0;
+  const rate = cfg.costs.handlingHourlyRate;
+  const handlingLabeling = dc2.has('handlingLabeling') ? 0 : (labelingMins/60) * rate;
+  let priceExcl = Math.max(inkoop*1.5,0.01);
+  for (let i=0;i<120;i++) {
+    const priceIncl=priceExcl*vatMult;
+    const verzend=dc2.has('verzend')?0:shippingShare(priceIncl,segCfg,vatMult);
+    const handlingVerzending=dc2.has('handlingVerzending')?0:(verzendingMins/60)*(priceIncl/segCfg.avgOrderValue)*rate;
+    const effectiveTransRate=dc2.has('transactie')?0:transRate;
+    const fixed=inkoop+verpakking+opslag+handlingLabeling+verzend+handlingVerzending;
+    const denom=1-targetGm3-effectiveTransRate; if(denom<=0) break;
+    const np=fixed/denom; if(Math.abs(np-priceExcl)<0.0001){priceExcl=np;break;} priceExcl=np;
+  }
+  const priceIncl=priceExcl*vatMult;
+  return { priceExcl,priceIncl,pkgPerKgExcl:weight>0?priceExcl/weight:priceExcl,pkgPerKgIncl:weight>0?priceIncl/weight:priceIncl };
+}
+
+function calcRetailData(sub, cfg, consumerPriceIncl) {
+  if (!consumerPriceIncl||consumerPriceIncl<=0) return null;
+  const rc=cfg.segments.retail, vatMult=1+sub.vatPercent/100;
+  // Retailer + eigen marge altijd op excl. BTW basis (B2B)
+  const consumerPriceExcl = consumerPriceIncl / vatMult;
+  const stdExcl = consumerPriceExcl * (1 - rc.retailerMargin);
+  const costs = calcBreakdown(sub,'retail',cfg, stdExcl * vatMult); // intern incl. voor ratio
+  if (costs&&costs.gm3Pct>=rc.minOwnMargin)
+    return {retailPriceExcl:stdExcl, retailerMarginActual:rc.retailerMargin, constrained:false, costs};
+  const mp = calcMinPrice(sub,'retail',cfg,rc.minOwnMargin);
+  const arm = consumerPriceExcl>0 ? 1 - mp.priceExcl/consumerPriceExcl : 0;
+  return {retailPriceExcl:mp.priceExcl, retailerMarginActual:Math.max(0,arm), constrained:true,
+    costs:calcBreakdown(sub,'retail',cfg,mp.priceIncl)};
+}
+
+// ── FORMATTERS ─────────────────────────────────────────────────────────────
+const fmt=(n,d=2)=>n==null||isNaN(n)?'—':new Intl.NumberFormat('nl-NL',{minimumFractionDigits:d,maximumFractionDigits:d}).format(n);
+const eur=(n,d=2)=>n==null||isNaN(n)?'—':'€ '+fmt(n,d);
+const pct=(n)=>n==null||isNaN(n)?'—':fmt(n*100,1)+'%';
+
+// ── STORAGE ────────────────────────────────────────────────────────────────
+const LS = {
+  load:(k,fb)=>{ try{const r=localStorage.getItem(k);return r?JSON.parse(r):fb;}catch{return fb;} },
+  save:(k,v)=>{ try{localStorage.setItem(k,JSON.stringify(v));}catch{} }
+};
+function mergeDeep(base,over){
+  const r={...base};
+  for(const k of Object.keys(over||{})){
+    if(over[k]&&typeof over[k]==='object'&&!Array.isArray(over[k])) r[k]=mergeDeep(base[k]??{},over[k]);
+    else r[k]=over[k];
+  }
+  return r;
+}
+// Migrate products: ensure subproducts have priceListSegments + normalize competitorPrices
+function migrateProducts(products){
+  return (products||[]).map(p=>({
+    ...p,
+    subproducts: (p.subproducts||[]).map(s=>{
+      const compPrices = ((s.segments?.consumenten?.competitorPrices)||[]).map((c,i)=>
+        typeof c==='number' ? {id:`migrated-${i}-${Math.random()}`,name:'',price:c,url:''}
+        : (c.id ? c : {...c,id:crypto.randomUUID()})
+      );
+      return {
+        priceListSegments: [],
+        activeSegments: ['consumenten','retail','horeca'],
+        ...s,
+        segments: {
+          ...s.segments,
+          consumenten: { disabledCosts:[], ...s.segments?.consumenten, competitorPrices: compPrices },
+          retail:  { disabledCosts:[], ...(s.segments?.retail  ?? { packagingType:'wikkel',  chosenPriceInclBtw:null }) },
+          horeca:  { disabledCosts:[], ...(s.segments?.horeca  ?? { packagingType:'sticker', chosenPriceInclBtw:null }) }
+        }
+      };
+    })
+  }));
+}
+
+// Migrate flat handlingMinutes numbers to {labeling, verzending} objects
+function migrateConfig(cfg){
+  const hm = cfg?.costs?.handlingMinutes;
+  if(hm) {
+    for(const seg of SEGS){
+      if(typeof hm[seg] === 'number'){
+        hm[seg] = { labeling: hm[seg], verzending: 0 };
+      }
+    }
+  }
+  return cfg;
+}
+
+// ── STATE ──────────────────────────────────────────────────────────────────
+const Ctx = createContext(null);
+const useApp = () => useContext(Ctx);
+
+function reducer(s,a){
+  switch(a.type){
+    case 'NAV': return {...s,page:a.page,selProdId:a.pid??null};
+    case 'ADD_PROD': return {...s,products:[...s.products,{id:crypto.randomUUID(),name:'',animalTypes:[],productTypes:[],subproducts:[],...a.data}]};
+    case 'UPD_PROD': return {...s,products:s.products.map(p=>p.id===a.id?{...p,...a.data}:p)};
+    case 'DEL_PROD': return {...s,products:s.products.filter(p=>p.id!==a.id),page:'products'};
+    case 'DUP_PROD': {
+      const src=s.products.find(p=>p.id===a.id);
+      if(!src) return s;
+      const dup={...JSON.parse(JSON.stringify(src)),id:crypto.randomUUID(),name:src.name+' (kopie)',subproducts:src.subproducts.map(ss=>({...JSON.parse(JSON.stringify(ss)),id:crypto.randomUUID()}))};
+      return {...s,products:[...s.products,dup]};
+    }
+    case 'ADD_SUB': return {...s,products:s.products.map(p=>p.id===a.pid?{...p,subproducts:[...p.subproducts,{...mkSub(),...a.sub,id:crypto.randomUUID()}]}:p)};
+    case 'UPD_SUB': return {...s,products:s.products.map(p=>p.id!==a.pid?p:{...p,subproducts:p.subproducts.map(ss=>ss.id===a.sid?{...ss,...a.data}:ss)})};
+    case 'DEL_SUB': return {...s,products:s.products.map(p=>p.id!==a.pid?p:{...p,subproducts:p.subproducts.filter(ss=>ss.id!==a.sid)})};
+    case 'DUP_SUB': {
+      const prod=s.products.find(p=>p.id===a.pid);
+      const src=prod?.subproducts.find(ss=>ss.id===a.sid);
+      if(!src||!prod) return s;
+      const dup={...JSON.parse(JSON.stringify(src)),id:crypto.randomUUID(),name:src.name+' (kopie)'};
+      return {...s,products:s.products.map(p=>p.id!==a.pid?p:{...p,subproducts:[...p.subproducts,dup]})};
+    }
+    case 'SET_PRICE': return {...s,products:s.products.map(p=>p.id!==a.pid?p:{...p,subproducts:p.subproducts.map(ss=>ss.id!==a.sid?ss:{...ss,segments:{...ss.segments,[a.seg]:{...ss.segments[a.seg],chosenPriceInclBtw:a.price}}})})};
+    case 'SET_COMP': return {...s,products:s.products.map(p=>p.id!==a.pid?p:{...p,subproducts:p.subproducts.map(ss=>ss.id!==a.sid?ss:{...ss,segments:{...ss.segments,consumenten:{...ss.segments.consumenten,competitorPrices:a.prices}}})})};
+    case 'TOGGLE_PRICELIST_SEG': {
+      return {...s,products:s.products.map(p=>p.id!==a.pid?p:{...p,subproducts:p.subproducts.map(ss=>{
+        if(ss.id!==a.sid) return ss;
+        const cur=ss.priceListSegments||[];
+        const next=cur.includes(a.seg)?cur.filter(x=>x!==a.seg):[...cur,a.seg];
+        return {...ss,priceListSegments:next};
+      })})};
+    }
+    case 'UPD_CFG': return {...s,config:mergeDeep(s.config,a.data)};
+    case 'IMPORT': return {...s,products:a.products??s.products,config:a.config??s.config};
+    default: return s;
+  }
+}
+
+function AppProvider({children}){
+  const init=()=>({
+    products:migrateProducts(LS.load('pdtr_products',DEMO)),
+    config:migrateConfig(mergeDeep(DEFAULT_CONFIG,LS.load('pdtr_config',{}))),
+    page:'products',selProdId:null
+  });
+  const [state,dispatch]=useReducer(reducer,null,init);
+  useEffect(()=>LS.save('pdtr_products',state.products),[state.products]);
+  useEffect(()=>LS.save('pdtr_config',state.config),[state.config]);
+  return <Ctx.Provider value={{state,dispatch}}>{children}</Ctx.Provider>;
+}
+
+// ── SHARED UI ──────────────────────────────────────────────────────────────
+function Badge({color,children}){
+  const cls={green:'bg-green-100 text-green-800',red:'bg-red-100 text-red-800',yellow:'bg-yellow-100 text-yellow-800',gray:'bg-gray-100 text-gray-600',blue:'bg-blue-100 text-blue-800'}[color]||'bg-gray-100 text-gray-600';
+  return <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${cls}`}>{children}</span>;
+}
+function MarginBadge({v}){
+  if(v==null||isNaN(v)) return null;
+  return <Badge color={v<0?'red':v<0.15?'yellow':v<0.30?'yellow':'green'}>{pct(v)}</Badge>;
+}
+function MarginBar({v}){
+  const w=Math.max(0,Math.min(1,v??0))*100;
+  const bg=!v||v<0?'bg-red-500':v<0.15?'bg-orange-400':v<0.30?'bg-yellow-400':'bg-green-500';
+  return <div className="h-1.5 w-20 rounded-full bg-gray-100 overflow-hidden inline-block"><div className={`h-full rounded-full ${bg}`} style={{width:`${w}%`}}/></div>;
+}
+function Inp({label,value,onChange,type='number',step='0.01',min='0',placeholder,cls='w-28',helper,pre,suf}){
+  return <div>
+    {label&&<label className="block text-xs font-medium text-gray-600 mb-1">{label}</label>}
+    <div className="flex items-center gap-1.5">
+      {pre&&<span className="text-gray-400 text-sm">{pre}</span>}
+      <input type={type} step={step} min={min} value={value??''} placeholder={placeholder}
+        onChange={e=>onChange(type==='number'?(e.target.value===''?null:parseFloat(e.target.value)):e.target.value)}
+        className={`inp ${cls}`}/>
+      {suf&&<span className="text-gray-400 text-sm">{suf}</span>}
+    </div>
+    {helper&&<p className="text-xs text-gray-400 mt-1">{helper}</p>}
+  </div>;
+}
+function Modal({title,onClose,children,wide}){
+  return <div className="fixed inset-0 bg-black/40 flex items-start justify-center pt-10 z-50 overflow-auto px-4 pb-8">
+    <div className={`bg-white rounded-xl shadow-2xl w-full ${wide?'max-w-3xl':'max-w-xl'} fade`}>
+      <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+        <h2 className="font-semibold text-lg text-gray-900">{title}</h2>
+        <button onClick={onClose} className="w-8 h-8 flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-700 text-lg">✕</button>
+      </div>
+      {children}
+    </div>
+  </div>;
+}
+function MultiToggle({options,selected,onChange,small}){
+  return <div className="flex flex-wrap gap-1.5">
+    {options.map(o=>(
+      <button key={o} type="button"
+        onClick={()=>onChange(selected.includes(o)?selected.filter(x=>x!==o):[...selected,o])}
+        className={`px-2.5 py-1 rounded-full border transition-colors ${small?'text-xs':'text-sm'} ${selected.includes(o)?'bg-green-700 border-green-700 text-white':'bg-white border-gray-200 text-gray-600 hover:border-green-400'}`}>
+        {o}
+      </button>
+    ))}
+  </div>;
+}
+function Card({title,children}){
+  return <div className="bg-white rounded-xl border border-gray-200">
+    <div className="px-5 py-3 border-b border-gray-100"><h2 className="font-semibold text-gray-800">{title}</h2></div>
+    <div className="p-5 space-y-4">{children}</div>
+  </div>;
+}
+
+// ── COST BREAKDOWN ─────────────────────────────────────────────────────────
+function CostBreakdown({bd}){
+  const [open,setOpen]=useState(false);
+  if(!bd) return null;
+  return <div className="mt-3">
+    <button type="button" onClick={()=>setOpen(x=>!x)} className="text-xs text-green-700 hover:underline flex items-center gap-1">
+      {open?'▲':'▼'} Kostenopbouw
+    </button>
+    {open&&<div className="mt-2 rounded-lg border border-gray-200 overflow-hidden text-sm fade">
+      <table className="w-full">
+        <tbody>
+          {[['Verkoopprijs excl. BTW',bd.priceExcl,null,false,false,false,null],
+            ['Inkoopprijs',bd.inkoop,null,false,false,false,null],
+            ['GM1 — na inkoop',bd.gm1,bd.gm1Pct,false,false,false,null],
+            ['Verpakking',bd.verpakking,null,false,true,false,null],
+            ['Transactiekosten',bd.transactie,null,false,true,false,'transactie'],
+            ['Opslagkosten',bd.opslag,null,false,true,false,'opslag'],
+            ['Handlingskosten labeling',bd.handlingLabeling,null,false,true,false,'handlingLabeling'],
+            ['GM2 — na vaste kosten',bd.gm2,bd.gm2Pct,false,false,false,null],
+            ['Verzendkosten (aandeel)',bd.verzend,null,false,true,false,'verzend'],
+            ['Handlingskosten verzending (aandeel)',bd.handlingVerzending,null,false,true,false,'handlingVerzending'],
+            ['GM3 — na alle kosten',bd.gm3,bd.gm3Pct,false,false,true,null]
+          ].map(([label,val,p,,indent,hi,costId])=>{
+            const isOff = costId && (bd.disabledCosts||[]).includes(costId);
+            return <tr key={label} className={hi?'bg-green-50 font-semibold':isOff?'opacity-40':''}>
+              <td className={`py-1.5 px-3 text-gray-700 ${indent?'pl-6':''}${isOff?' line-through':''}`}>
+                {label}{isOff&&<span className="ml-1.5 text-xs font-normal no-underline normal-case" style={{textDecoration:'none'}}>
+                  <span className="px-1.5 py-0.5 bg-gray-100 text-gray-400 rounded text-xs" style={{textDecoration:'none'}}>uitgeschakeld</span>
+                </span>}
+              </td>
+              <td className="py-1.5 px-3 text-right font-mono">{eur(val)}</td>
+              <td className="py-1.5 px-3 text-right">{p!=null&&<div className="flex items-center justify-end gap-2"><MarginBar v={p}/><MarginBadge v={p}/></div>}</td>
+            </tr>;
+          })}
+        </tbody>
+      </table>
+    </div>}
+  </div>;
+}
+function GmSummary({bd}){
+  if(!bd) return null;
+  return <div className="grid grid-cols-3 gap-2 text-center">
+    {[['GM1',bd.gm1,bd.gm1Pct],['GM2',bd.gm2,bd.gm2Pct],['GM3',bd.gm3,bd.gm3Pct]].map(([l,v,p])=>(
+      <div key={l} className="bg-gray-50 rounded-lg py-2 px-3">
+        <div className="text-xs text-gray-500">{l}</div>
+        <div className="font-bold text-sm mt-0.5">{eur(v)}</div>
+        <div className="mt-0.5"><MarginBadge v={p}/></div>
+      </div>
+    ))}
+  </div>;
+}
+
+// ── SUBPRODUCT FORM ────────────────────────────────────────────────────────
+function SubproductForm({prodId,existing,onClose}){
+  const {dispatch}=useApp();
+  const [f,setF]=useState(()=>existing?JSON.parse(JSON.stringify(existing)):{...mkSub()});
+
+  const setField=(path,val)=>setF(prev=>{
+    const next=JSON.parse(JSON.stringify(prev));
+    const keys=path.split('.');let o=next;
+    for(let i=0;i<keys.length-1;i++) o=o[keys[i]];
+    o[keys[keys.length-1]]=val; return next;
+  });
+
+  // Supplier helpers
+  const addSupplier=()=>setF(p=>({...p,suppliers:[...(p.suppliers||[]),{id:crypto.randomUUID(),name:'',pricePerUnit:0,unit:'kg',active:false}]}));
+  const updSupplier=(id,field,val)=>setF(p=>({...p,suppliers:p.suppliers.map(s=>s.id===id?{...s,[field]:val}:s)}));
+  const setActiveSupplier=(id)=>setF(p=>({...p,suppliers:p.suppliers.map(s=>({...s,active:s.id===id}))}));
+  const delSupplier=(id)=>setF(p=>({...p,suppliers:p.suppliers.filter(s=>s.id!==id)}));
+
+  const save=()=>{
+    if(!f.name.trim()) return;
+    // Sync purchasePricePerUnit/purchaseUnit from active supplier
+    const active=(f.suppliers||[]).find(s=>s.active);
+    const toSave={...f};
+    if(active){ toSave.purchasePricePerUnit=active.pricePerUnit; toSave.purchaseUnit=active.unit; }
+    if(existing) dispatch({type:'UPD_SUB',pid:prodId,sid:f.id,data:toSave});
+    else dispatch({type:'ADD_SUB',pid:prodId,sub:toSave});
+    onClose();
+  };
+
+  return <Modal title={existing?'Variant bewerken':'Nieuwe variant'} onClose={onClose} wide>
+    <div className="p-6 space-y-5 overflow-auto max-h-[72vh]">
+      {/* Base */}
+      <div className="grid grid-cols-2 gap-4">
+        <div className="col-span-2">
+          <label className="block text-sm font-medium text-gray-700 mb-1">Naam variant</label>
+          <input className="inp w-full" value={f.name} onChange={e=>setField('name',e.target.value)} placeholder="bijv. Per kilo, 2x 180g, Bulk 5kg" autoFocus/>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Gewicht (kg)</label>
+          <input type="number" min="0" step="0.001" className="inp w-full" value={f.weight} onChange={e=>setField('weight',parseFloat(e.target.value)||0)}/>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">BTW %</label>
+          <select className="inp w-full" value={f.vatPercent} onChange={e=>setField('vatPercent',parseInt(e.target.value))}>
+            <option value={9}>9%</option><option value={21}>21%</option><option value={0}>0%</option>
+          </select>
+        </div>
+      </div>
+
+      {/* Suppliers */}
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="font-medium text-sm text-gray-800">Leveranciers</h3>
+          <button type="button" onClick={addSupplier} className="text-xs text-green-700 hover:underline">+ Toevoegen</button>
+        </div>
+        <div className="space-y-2">
+          {(f.suppliers||[]).map(s=>(
+            <div key={s.id} className={`flex items-center gap-2 p-2.5 rounded-lg border ${s.active?'border-green-400 bg-green-50':'border-gray-200 bg-gray-50'}`}>
+              <input type="radio" checked={s.active} onChange={()=>setActiveSupplier(s.id)} className="accent-green-700 mt-0.5"/>
+              <input className="inp flex-1 min-w-0" value={s.name} onChange={e=>updSupplier(s.id,'name',e.target.value)} placeholder="Leveranciernaam"/>
+              <span className="text-gray-400 text-sm">€</span>
+              <input type="number" min="0" step="0.01" className="inp w-24" value={s.pricePerUnit} onChange={e=>updSupplier(s.id,'pricePerUnit',parseFloat(e.target.value)||0)}/>
+              <select className="inp w-20" value={s.unit} onChange={e=>updSupplier(s.id,'unit',e.target.value)}>
+                <option value="kg">/ kg</option><option value="stuk">/ stuk</option>
+              </select>
+              {(f.suppliers||[]).length>1&&<button type="button" onClick={()=>delSupplier(s.id)} className="text-gray-300 hover:text-red-500 text-sm">✕</button>}
+            </div>
+          ))}
+        </div>
+        {(f.suppliers||[]).find(s=>s.active)&&<p className="text-xs text-gray-400 mt-1">Inkoopprijs berekend met: <strong>{(f.suppliers.find(s=>s.active).name)||'actieve leverancier'}</strong> — {eur((f.suppliers.find(s=>s.active)||{}).pricePerUnit)}/{(f.suppliers.find(s=>s.active)||{}).unit}</p>}
+      </div>
+
+      {/* Verkoopkanalen */}
+      <div>
+        <h3 className="font-medium text-sm text-gray-800 mb-2">Verkoopkanalen</h3>
+        <p className="text-xs text-gray-400 mb-2">Vink alleen de kanalen aan waarvoor dit product beschikbaar is.</p>
+        <div className="flex gap-2">
+          {SEGS.map(seg=>{
+            const active=(f.activeSegments||SEGS).includes(seg);
+            return <label key={seg} className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-lg border text-sm font-medium transition-colors ${active?'bg-green-700 border-green-700 text-white':'bg-white border-gray-200 text-gray-500 hover:border-gray-300'}`}>
+              <input type="checkbox" checked={active} className="sr-only"
+                onChange={()=>{
+                  const cur=f.activeSegments||SEGS;
+                  setField('activeSegments', active?cur.filter(x=>x!==seg):[...cur,seg]);
+                }}/>
+              {active?'✓ ':''}{SEG_LABELS[seg]}
+            </label>;
+          })}
+        </div>
+      </div>
+
+      {/* Segment packaging + disabled costs */}
+      <div>
+        <h3 className="font-medium text-sm text-gray-800 mb-3">Instellingen per segment</h3>
+        <div className="space-y-3">
+          {SEGS.filter(seg=>(f.activeSegments||SEGS).includes(seg)).map(seg=>{
+            const dc = f.segments[seg].disabledCosts || [];
+            const toggleCost = (costId) => {
+              const next = dc.includes(costId) ? dc.filter(x=>x!==costId) : [...dc, costId];
+              setField(`segments.${seg}.disabledCosts`, next);
+            };
+            const COSTS = [
+              {id:'transactie',      label:'Transactiekosten'},
+              {id:'opslag',          label:'Opslagkosten'},
+              {id:'handlingLabeling',label:'Handling labeling'},
+              {id:'verzend',         label:'Verzendkosten'},
+              {id:'handlingVerzending',label:'Handling verzending'},
+            ];
+            return <div key={seg} className="bg-gray-50 rounded-lg p-3">
+              <div className="text-xs font-semibold text-gray-700 mb-3">{SEG_LABELS[seg]}</div>
+              <div className="mb-2">
+                <div className="text-xs text-gray-500 mb-1">Verpakking</div>
+                <select className="inp w-full text-xs" value={f.segments[seg].packagingType}
+                  onChange={e=>setField(`segments.${seg}.packagingType`,e.target.value)}>
+                  {PKG_OPTIONS[seg].map(o=><option key={o} value={o}>{PKG_LABELS[o]}</option>)}
+                </select>
+              </div>
+              <div>
+                <div className="text-xs text-gray-500 mb-1.5">Kosten van toepassing</div>
+                <div className="flex flex-wrap gap-x-3 gap-y-1.5">
+                  {COSTS.map(c=>{
+                    const active = !dc.includes(c.id);
+                    return <label key={c.id} className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={active}
+                        onChange={()=>toggleCost(c.id)}
+                        className="w-3.5 h-3.5 accent-green-700"/>
+                      <span className={`text-xs ${active?'text-gray-700':'text-gray-400 line-through'}`}>{c.label}</span>
+                    </label>;
+                  })}
+                </div>
+              </div>
+            </div>;
+          })}
+        </div>
+      </div>
+    </div>
+    <div className="px-6 py-4 border-t border-gray-100 flex justify-end gap-3">
+      <button type="button" onClick={onClose} className="px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">Annuleren</button>
+      <button type="button" onClick={save} className="px-4 py-2 bg-green-700 text-white rounded-lg text-sm hover:bg-green-800">Opslaan</button>
+    </div>
+  </Modal>;
+}
+
+// ── SENSITIVITY PANEL ──────────────────────────────────────────────────────
+function SensitivityPanel({prod,sub}){
+  const {state}=useApp();
+  const cfg=state.config;
+  const [mode,setMode]=useState('weight'); // 'weight' | 'price'
+  const baseWeight=sub.weight;
+  const basePrice=sub.segments.consumenten.chosenPriceInclBtw;
+
+  const weightRows=useMemo(()=>{
+    const steps=[-0.20,-0.15,-0.10,-0.05,0,0.05,0.10,0.15,0.20];
+    return steps.map(d=>{
+      const w=baseWeight*(1+d);
+      const minP=calcMinPrice(sub,'consumenten',cfg,cfg.segments.consumenten.targetMarginMin,w);
+      const bd=basePrice?calcBreakdown(sub,'consumenten',cfg,basePrice,w):null;
+      return { delta:d, weight:w, weightG:Math.round(w*1000), minPrice:minP.priceIncl, minKg:minP.pkgPerKgIncl, bd };
+    });
+  },[sub,cfg,baseWeight,basePrice]);
+
+  const priceRows=useMemo(()=>{
+    if(!basePrice) return [];
+    const steps=[-0.25,-0.20,-0.15,-0.10,-0.05,0,0.05,0.10,0.15,0.20,0.25];
+    return steps.map(d=>{
+      const p=basePrice*(1+d);
+      const bd=calcBreakdown(sub,'consumenten',cfg,p);
+      return { delta:d, price:p, bd };
+    });
+  },[sub,cfg,basePrice]);
+
+  return <div>
+    <div className="flex gap-2 mb-4">
+      {[['weight','Gewichtsschommeling'],['price','Prijssensitiviteit']].map(([m,l])=>(
+        <button key={m} type="button" onClick={()=>setMode(m)}
+          className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${mode===m?'bg-green-700 text-white border-green-700':'border-gray-300 text-gray-600 hover:bg-gray-50'}`}>{l}</button>
+      ))}
+    </div>
+
+    {mode==='weight'&&<div>
+      <p className="text-xs text-gray-500 mb-3">Effect van ±gewicht op minimumprijs en marge bij huidige verkoopprijs ({eur(basePrice||0)}).</p>
+      <div className="overflow-x-auto rounded-lg border border-gray-200">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Δ Gewicht</th>
+              <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Gewicht</th>
+              <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Min. prijs</th>
+              <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Min. €/kg</th>
+              {basePrice&&<th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">GM3 @ huidig</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {weightRows.map(r=>(
+              <tr key={r.delta} className={`border-t border-gray-100 ${r.delta===0?'bg-green-50 font-semibold':''}`}>
+                <td className="px-3 py-2">{r.delta===0?'Basis':r.delta>0?`+${Math.round(r.delta*100)}%`:`${Math.round(r.delta*100)}%`}</td>
+                <td className="px-3 py-2 font-mono">{r.weightG}g</td>
+                <td className="px-3 py-2 font-mono">{eur(r.minPrice)}</td>
+                <td className="px-3 py-2 font-mono">{eur(r.minKg)}</td>
+                {basePrice&&<td className="px-3 py-2">{r.bd?<MarginBadge v={r.bd.gm3Pct}/>:'—'}</td>}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>}
+
+    {mode==='price'&&<div>
+      {!basePrice&&<p className="text-sm text-gray-400 italic">Stel eerst een consumentenprijs in.</p>}
+      {basePrice&&<div>
+        <p className="text-xs text-gray-500 mb-3">Effect van prijswijziging op GM1/GM2/GM3.</p>
+        <div className="overflow-x-auto rounded-lg border border-gray-200">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Δ Prijs</th>
+                <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Prijs incl.</th>
+                <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">€/kg incl.</th>
+                <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">GM1</th>
+                <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">GM2</th>
+                <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">GM3</th>
+              </tr>
+            </thead>
+            <tbody>
+              {priceRows.map(r=>(
+                <tr key={r.delta} className={`border-t border-gray-100 ${r.delta===0?'bg-green-50 font-semibold':''}`}>
+                  <td className="px-3 py-2">{r.delta===0?'Basis':r.delta>0?`+${Math.round(r.delta*100)}%`:`${Math.round(r.delta*100)}%`}</td>
+                  <td className="px-3 py-2 font-mono">{eur(r.price)}</td>
+                  <td className="px-3 py-2 font-mono">{eur(r.price/sub.weight)}</td>
+                  <td className="px-3 py-2">{r.bd?<MarginBadge v={r.bd.gm1Pct}/>:'—'}</td>
+                  <td className="px-3 py-2">{r.bd?<MarginBadge v={r.bd.gm2Pct}/>:'—'}</td>
+                  <td className="px-3 py-2">{r.bd?<MarginBadge v={r.bd.gm3Pct}/>:'—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>}
+    </div>}
+  </div>;
+}
+
+// ── OVERVIEW PANEL ─────────────────────────────────────────────────────────
+function OverviewPanel({prod,sub}){
+  const {state}=useApp();
+  const cfg=state.config;
+  const vatMult=1+sub.vatPercent/100;
+  const consumerPrice=sub.segments.consumenten.chosenPriceInclBtw;
+  const rd=consumerPrice?calcRetailData(sub,cfg,consumerPrice):null;
+  const horecaAuto=calcMinPrice(sub,'horeca',cfg,cfg.segments.horeca.targetMargin);
+
+  // consumenten: incl. BTW | retail + horeca: excl. BTW
+  const activeSegs=sub.activeSegments||SEGS;
+  const rows=SEGS.filter(seg=>activeSegs.includes(seg)).map(seg=>{
+    const segCfg=cfg.segments[seg];
+    const isB2B = seg!=='consumenten';
+    const minP=calcMinPrice(sub,seg,cfg,seg==='consumenten'?segCfg.targetMarginMin:seg==='retail'?segCfg.minOwnMargin:segCfg.targetMargin);
+    const storedPrice=sub.segments[seg].chosenPriceInclBtw; // excl. for B2B, incl. for cons
+    let activeExcl, activeForCalc;
+    if(seg==='consumenten'){
+      const activeIncl=storedPrice??null;
+      activeExcl=activeIncl?activeIncl/vatMult:null;
+      activeForCalc=activeIncl;
+    } else {
+      activeExcl=storedPrice??(seg==='retail'&&rd?rd.retailPriceExcl:seg==='horeca'?horecaAuto.priceExcl:null);
+      activeForCalc=activeExcl?activeExcl*vatMult:null;
+    }
+    const bd=activeForCalc?calcBreakdown(sub,seg,cfg,activeForCalc):null;
+    const minDisplay=isB2B?minP.priceExcl:minP.priceIncl;
+    const minKgDisplay=isB2B?minP.pkgPerKgExcl:minP.pkgPerKgIncl;
+    return {seg,isB2B,minDisplay,minKgDisplay,activeExcl,activeForCalc,bd};
+  });
+
+  return <div>
+    <div className="overflow-x-auto rounded-lg border border-gray-200">
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50">
+          <tr>
+            <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Segment</th>
+            <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Minimumprijs</th>
+            <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Actieve prijs</th>
+            <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">€/kg excl.</th>
+            <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">GM1</th>
+            <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">GM2</th>
+            <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">GM3</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(({seg,isB2B,minDisplay,minKgDisplay,activeExcl,activeForCalc,bd})=>(
+            <tr key={seg} className="border-t border-gray-100">
+              <td className="px-4 py-3 font-medium">
+                {SEG_LABELS[seg]}
+                <div className="text-xs text-gray-400 font-normal">{isB2B?'excl. BTW':'incl. BTW'}</div>
+              </td>
+              <td className="px-4 py-3 font-mono text-sm">{eur(minDisplay)}<span className="text-xs text-gray-400 ml-1">({eur(minKgDisplay)}/kg)</span></td>
+              <td className="px-4 py-3 font-mono text-sm">
+                {activeExcl?<>{eur(isB2B?activeExcl:activeExcl*vatMult)}{seg==='retail'&&rd?.constrained&&<span className="ml-1"><Badge color="yellow">min</Badge></span>}</>:<span className="text-gray-300">—</span>}
+              </td>
+              <td className="px-4 py-3 font-mono text-sm">{bd?eur(bd.pkgPerKgExcl):'—'}</td>
+              <td className="px-4 py-3">{bd?<MarginBadge v={bd.gm1Pct}/>:'—'}</td>
+              <td className="px-4 py-3">{bd?<MarginBadge v={bd.gm2Pct}/>:'—'}</td>
+              <td className="px-4 py-3">{bd?<MarginBadge v={bd.gm3Pct}/>:'—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+
+    {/* Inkoop summary */}
+    <div className="mt-4 bg-gray-50 rounded-lg p-4">
+      <h4 className="text-xs font-semibold text-gray-500 uppercase mb-2">Inkoopinformatie</h4>
+      <div className="flex flex-wrap gap-4 text-sm">
+        {(sub.suppliers||[]).map(s=>(
+          <div key={s.id} className={`flex items-center gap-2 ${s.active?'font-semibold text-green-800':' text-gray-500'}`}>
+            {s.active?'✓':'○'} {s.name||'Leverancier'}: {eur(s.pricePerUnit)}/{s.unit}
+            {s.active&&<Badge color="green">Actief</Badge>}
+          </div>
+        ))}
+      </div>
+    </div>
+  </div>;
+}
+
+// ── PRICE LIST SUB TOGGLE ──────────────────────────────────────────────────
+function PriceListSubToggle({prod,sub,compact}){
+  const {dispatch}=useApp();
+  const segs=sub.priceListSegments||[];
+  return <div className={`flex items-center gap-1.5 flex-wrap ${compact?'':'mt-2'}`}>
+    {!compact&&<span className="text-xs font-medium text-gray-400 mr-0.5">Prijslijst:</span>}
+    {SEGS.map(seg=>{
+      const on=segs.includes(seg);
+      return <label key={seg} onClick={e=>e.stopPropagation()}
+        className={`flex items-center gap-1 cursor-pointer px-2 py-0.5 rounded-full border text-xs font-medium transition-colors ${on?'bg-green-700 border-green-700 text-white':'bg-white border-gray-200 text-gray-500 hover:border-green-400'}`}>
+        <input type="checkbox" checked={on}
+          onChange={()=>dispatch({type:'TOGGLE_PRICELIST_SEG',pid:prod.id,sid:sub.id,seg})}
+          className="sr-only"/>
+        {on?'✓ ':''}{SEG_LABELS[seg][0].toUpperCase()+SEG_LABELS[seg].slice(1,4)}
+      </label>;
+    })}
+  </div>;
+}
+
+// ── SEGMENT PANELS ─────────────────────────────────────────────────────────
+function ConsumentenPanel({prod,sub}){
+  const {state,dispatch}=useApp();
+  const cfg=state.config;
+  const segCfg=cfg.segments.consumenten;
+  const segData=sub.segments.consumenten;
+  const vatMult=1+sub.vatPercent/100;
+  const minP=calcMinPrice(sub,'consumenten',cfg,segCfg.targetMarginMin);
+  const chosen=segData.chosenPriceInclBtw;
+  const bd=chosen?calcBreakdown(sub,'consumenten',cfg,chosen):null;
+  // Concurrenten invoeren per kg incl. BTW → omrekenen naar eenheidsprijs voor vergelijking
+  const validComps = (segData.competitorPrices||[]).filter(c=>c.price>0);
+  const avgCompPerKg = validComps.length ? validComps.reduce((a,c)=>a+c.price,0)/validComps.length : null;
+  const avgCompPerUnit = avgCompPerKg!=null ? avgCompPerKg * sub.weight : null;
+  const warn=bd&&bd.gm3Pct<segCfg.targetMarginMin;
+  const setPrice=p=>dispatch({type:'SET_PRICE',pid:prod.id,sid:sub.id,seg:'consumenten',price:p});
+
+  const updComp=(id,field,val)=>{
+    const prices=(segData.competitorPrices||[]).map(c=>c.id===id?{...c,[field]:val}:c);
+    dispatch({type:'SET_COMP',pid:prod.id,sid:sub.id,prices});
+  };
+  const addComp=()=>dispatch({type:'SET_COMP',pid:prod.id,sid:sub.id,prices:[...(segData.competitorPrices||[]),mkCompetitor()]});
+  const rmComp=id=>dispatch({type:'SET_COMP',pid:prod.id,sid:sub.id,prices:(segData.competitorPrices||[]).filter(c=>c.id!==id)});
+
+  return <div className="space-y-4">
+    <div className="bg-green-50 border border-green-200 rounded-lg p-3 inline-block">
+      <div className="text-xs text-green-700 font-medium mb-1">Minimumprijs (GM3 ≥ {pct(segCfg.targetMarginMin)})</div>
+      <div className="text-xl font-bold text-gray-900">{eur(minP.priceIncl)}</div>
+      <div className="text-xs text-gray-500 mt-1">{eur(minP.pkgPerKgIncl)}/kg incl. • {eur(minP.pkgPerKgExcl)}/kg excl.</div>
+    </div>
+
+    {/* Competitors */}
+    <div className="border border-gray-200 rounded-lg p-3">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs font-medium text-gray-600">Concurrentieprijzen <span className="text-gray-400 font-normal">(per kg incl. BTW)</span></span>
+        <button type="button" onClick={addComp} className="text-xs text-green-700 hover:underline">+ Toevoegen</button>
+      </div>
+      {(segData.competitorPrices||[]).length>0&&<div className="space-y-2">
+        {/* Kolomlabels */}
+        <div className="flex items-center gap-2 text-xs text-gray-400 px-0.5">
+          <span className="w-28">Naam</span>
+          <span className="w-24 text-center">€/kg incl. BTW</span>
+          <span className="flex-1 min-w-32">URL</span>
+        </div>
+        {segData.competitorPrices.map((c,i)=>(
+          <div key={c.id||i} className="flex items-center gap-2 flex-wrap">
+            <input className="inp w-28" value={c.name} onChange={e=>updComp(c.id,'name',e.target.value)} placeholder="Naam"/>
+            <div className="flex items-center gap-1 w-24">
+              <span className="text-gray-400 text-sm">€</span>
+              <input type="number" step="0.05" className="inp flex-1" value={c.price||''} onChange={e=>updComp(c.id,'price',parseFloat(e.target.value)||0)} placeholder="0,00"/>
+            </div>
+            {c.price>0&&<span className="text-xs text-gray-400">→ {eur(c.price*sub.weight)}/stuk</span>}
+            <input className="inp flex-1 min-w-32" value={c.url} onChange={e=>updComp(c.id,'url',e.target.value)} placeholder="URL (optioneel)"/>
+            {c.url&&<a href={c.url} target="_blank" rel="noopener" className="text-blue-600 hover:underline text-xs">↗</a>}
+            <button type="button" onClick={()=>rmComp(c.id)} className="text-red-400 hover:text-red-600 text-sm">✕</button>
+          </div>
+        ))}
+        {avgCompPerKg!=null&&<div className="mt-2 pt-2 border-t border-gray-100 text-xs text-gray-500 flex items-center gap-3 flex-wrap">
+          <span>Gem. kiloprijs: <strong className="text-gray-800">{eur(avgCompPerKg)}/kg</strong></span>
+          <span className="text-gray-300">·</span>
+          <span>Gem. eenheidsprijs: <strong className="text-gray-800">{eur(avgCompPerUnit)}</strong></span>
+          <button type="button" onClick={()=>setPrice(Math.round(avgCompPerUnit*20)/20)} className="text-green-700 hover:underline">Overnemen</button>
+        </div>}
+      </div>}
+    </div>
+
+    {/* Chosen price */}
+    <div className="flex items-end gap-6 flex-wrap">
+      <Inp label="Jouw verkoopprijs (incl. BTW)" value={chosen} onChange={setPrice} pre="€" cls="w-28"
+        helper={chosen?`excl. BTW: ${eur(chosen/vatMult)} • ${eur(chosen/sub.weight/vatMult)}/kg excl. • ${eur(chosen/sub.weight)}/kg incl.`:null}/>
+      {bd&&<GmSummary bd={bd}/>}
+    </div>
+    {warn&&<div className="flex items-center gap-2 text-sm px-3 py-2 rounded-lg bg-red-50 text-red-700">
+      ⚠️ GM3 ({pct(bd.gm3Pct)}) is onder het minimum van {pct(segCfg.targetMarginMin)}
+    </div>}
+
+    <CostBreakdown bd={bd}/>
+  </div>;
+}
+
+function RetailPanel({prod,sub}){
+  const {state,dispatch}=useApp();
+  const cfg=state.config;
+  const consumerP=sub.segments.consumenten.chosenPriceInclBtw;
+  const rd=consumerP?calcRetailData(sub,cfg,consumerP):null;
+  const vatMult=1+sub.vatPercent/100;
+  // chosenPriceInclBtw stores EXCL. BTW for retail (B2B)
+  const chosenExcl=sub.segments.retail.chosenPriceInclBtw;
+  const activeExcl=chosenExcl??rd?.retailPriceExcl;
+  const bd=activeExcl?calcBreakdown(sub,'retail',cfg,activeExcl*vatMult):null;
+  const minP=calcMinPrice(sub,'retail',cfg,cfg.segments.retail.minOwnMargin);
+  const setP=p=>dispatch({type:'SET_PRICE',pid:prod.id,sid:sub.id,seg:'retail',price:p});
+  const consumerExcl=consumerP?consumerP/vatMult:null;
+  if(!consumerP) return <div className="flex items-center gap-2 text-sm text-gray-500 bg-gray-50 rounded-lg p-4">ℹ️ Stel eerst de consumentenprijs in.</div>;
+  return <div className="space-y-4">
+    <div className="grid grid-cols-3 gap-3">
+      <div className="bg-gray-50 rounded-lg p-3">
+        <div className="text-xs text-gray-500 mb-1">Adviesprijs excl. BTW</div>
+        <div className="text-lg font-bold">{eur(consumerExcl)}</div>
+        <div className="text-xs text-gray-400">{eur(consumerP)} incl. BTW</div>
+      </div>
+      <div className={`rounded-lg p-3 ${rd?.constrained?'bg-yellow-50 border border-yellow-200':'bg-gray-50'}`}>
+        <div className="text-xs text-gray-500 mb-1">Retailprijs berekend excl. BTW</div>
+        <div className="text-lg font-bold">{eur(rd?.retailPriceExcl)}</div>
+        <div className="text-xs text-gray-500">Retailer marge: {pct(rd?.retailerMarginActual)}</div>
+        {rd?.constrained&&<Badge color="yellow">Min. eigen marge toegepast</Badge>}
+      </div>
+      <div className="bg-green-50 border border-green-200 rounded-lg p-3">
+        <div className="text-xs text-green-700 font-medium mb-1">Min. prijs excl. BTW (GM3 ≥ {pct(cfg.segments.retail.minOwnMargin)})</div>
+        <div className="text-lg font-bold">{eur(minP.priceExcl)}</div>
+        <div className="text-xs text-gray-500">{eur(minP.pkgPerKgExcl)}/kg excl.</div>
+      </div>
+    </div>
+    <div className="flex items-end gap-6 flex-wrap">
+      <div>
+        <Inp label="Overschrijf prijs excl. BTW (optioneel)" value={chosenExcl} onChange={setP} pre="€" cls="w-28"
+          helper={activeExcl?`${eur(activeExcl/sub.weight)}/kg excl. BTW`:null}/>
+        {chosenExcl&&<button type="button" onClick={()=>setP(null)} className="text-xs text-gray-400 hover:underline mt-1">Reset naar berekend</button>}
+      </div>
+      {bd&&<GmSummary bd={bd}/>}
+    </div>
+    <CostBreakdown bd={bd}/>
+  </div>;
+}
+
+function HorecaPanel({prod,sub}){
+  const {state,dispatch}=useApp();
+  const cfg=state.config;
+  const autoP=calcMinPrice(sub,'horeca',cfg,cfg.segments.horeca.targetMargin);
+  const vatMult=1+sub.vatPercent/100;
+  // chosenPriceInclBtw stores EXCL. BTW for horeca (B2B)
+  const chosenExcl=sub.segments.horeca.chosenPriceInclBtw;
+  const activeExcl=chosenExcl??autoP.priceExcl;
+  const bd=calcBreakdown(sub,'horeca',cfg,activeExcl*vatMult);
+  const setP=p=>dispatch({type:'SET_PRICE',pid:prod.id,sid:sub.id,seg:'horeca',price:p});
+  return <div className="space-y-4">
+    <div className="grid grid-cols-2 gap-3">
+      <div className="bg-green-50 border border-green-200 rounded-lg p-3">
+        <div className="text-xs text-green-700 font-medium mb-1">Adviesprijs excl. BTW ({pct(cfg.segments.horeca.targetMargin)} GM3)</div>
+        <div className="text-xl font-bold">{eur(autoP.priceExcl)}</div>
+        <div className="text-xs text-gray-500 mt-1">{eur(autoP.pkgPerKgExcl)}/kg excl. BTW</div>
+      </div>
+      <div className="bg-gray-50 rounded-lg p-3">
+        <div className="text-xs text-gray-500 mb-1">Kiloprijs excl. BTW</div>
+        <div className="text-xl font-bold">{eur(activeExcl/sub.weight)}/kg</div>
+        <div className="text-xs text-gray-500">Eenheidsprijs excl. BTW: {eur(activeExcl)}</div>
+      </div>
+    </div>
+    <div className="flex items-end gap-6 flex-wrap">
+      <div>
+        <Inp label="Overschrijf prijs excl. BTW (optioneel)" value={chosenExcl} onChange={setP} pre="€" cls="w-28"
+          helper={activeExcl?`${eur(activeExcl/sub.weight)}/kg excl. BTW`:null}/>
+        {chosenExcl&&<button type="button" onClick={()=>setP(null)} className="text-xs text-gray-400 hover:underline mt-1">Reset naar adviesprijs</button>}
+      </div>
+      {bd&&<GmSummary bd={bd}/>}
+    </div>
+    <CostBreakdown bd={bd}/>
+  </div>;
+}
+
+// ── PRICING PANEL ──────────────────────────────────────────────────────────
+function PricingPanel({prod,sub}){
+  const [seg,setSeg]=useState('consumenten');
+  const inkoop=activePurchaseCost(sub);
+  const activeSegs=sub.activeSegments||SEGS;
+  const TABS=[['consumenten','Consumenten'],['retail','Retail'],['horeca','Horeca'],['overzicht','Overzicht'],['sensitiviteit','Sensitiviteit']];
+  const isSegActive=id=>!SEGS.includes(id)||activeSegs.includes(id);
+  return <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
+    <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
+      <h3 className="font-semibold text-gray-900">{sub.name||'Variant'}</h3>
+      <div className="text-xs text-gray-400">
+        Inkoop {eur(inkoop)} • {Math.round(sub.weight*1000)}g • BTW {sub.vatPercent}%
+      </div>
+    </div>
+    <div className="flex border-b border-gray-100 px-5 overflow-x-auto">
+      {TABS.map(([id,label])=>{
+        const active=isSegActive(id);
+        return <button key={id} type="button" onClick={()=>setSeg(id)}
+          className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors whitespace-nowrap relative
+            ${seg===id?(active?'border-green-600 text-green-700':'border-gray-300 text-gray-500'):'border-transparent'}
+            ${!active&&seg!==id?'text-gray-300':''}
+            ${active&&seg!==id?'text-gray-500 hover:text-gray-700':''}`}>
+          {label}
+          {!active&&SEGS.includes(id)&&<span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-gray-300 rounded-full"/>}
+        </button>;
+      })}
+    </div>
+    <div className="p-5">
+      {SEGS.includes(seg)&&!isSegActive(seg)
+        ? <div className="flex flex-col items-center justify-center py-10 text-gray-400 gap-2">
+            <span className="text-2xl">🚫</span>
+            <p className="text-sm font-medium">Dit product wordt niet via {SEG_LABELS[seg]} verkocht.</p>
+            <p className="text-xs">Pas de verkoopkanalen aan via het potlood-icoontje op de variantkaart.</p>
+          </div>
+        : <>
+          {seg==='consumenten'&&<ConsumentenPanel prod={prod} sub={sub}/>}
+          {seg==='retail'&&<RetailPanel prod={prod} sub={sub}/>}
+          {seg==='horeca'&&<HorecaPanel prod={prod} sub={sub}/>}
+          {seg==='overzicht'&&<OverviewPanel prod={prod} sub={sub}/>}
+          {seg==='sensitiviteit'&&<SensitivityPanel prod={prod} sub={sub}/>}
+        </>
+      }
+    </div>
+  </div>;
+}
+
+// ── SUBPRODUCT CARD ────────────────────────────────────────────────────────
+function SubCard({prod,sub,selected,onSelect,onEdit,onDelete,onDuplicate}){
+  const {state}=useApp();
+  const consP=sub.segments.consumenten.chosenPriceInclBtw;
+  const bd=consP?calcBreakdown(sub,'consumenten',state.config,consP):null;
+  const minP=calcMinPrice(sub,'consumenten',state.config,state.config.segments.consumenten.targetMarginMin);
+  return <div onClick={onSelect}
+    className={`bg-white rounded-xl border transition-all cursor-pointer ${selected?'border-green-500 ring-2 ring-green-500':'border-gray-200 hover:border-gray-300'}`}>
+    <div className="p-4">
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <div className="font-semibold text-gray-900 text-sm">{sub.name||<span className="text-gray-400 italic">Naamloos</span>}</div>
+          <div className="text-xs text-gray-400 mt-0.5">{eur(activePurchaseCost(sub))} inkoop • {Math.round(sub.weight*1000)}g</div>
+        </div>
+        <div className="flex gap-0.5" onClick={e=>e.stopPropagation()}>
+          <button type="button" title="Bewerken" onClick={onEdit} className="p-1 text-gray-400 hover:text-gray-700 rounded text-sm">✏️</button>
+          <button type="button" title="Dupliceren" onClick={onDuplicate} className="p-1 text-gray-400 hover:text-green-600 rounded text-sm">⧉</button>
+          <button type="button" title="Verwijderen" onClick={onDelete} className="p-1 text-gray-400 hover:text-red-500 rounded text-sm">🗑</button>
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-1 text-center">
+        {[['Min.',eur(minP.priceIncl)],['Prijs',consP?eur(consP):'—'],['GM3',bd?null:'—']].map(([l,v])=>(
+          <div key={l} className="bg-gray-50 rounded p-1.5">
+            <div className="text-xs text-gray-400">{l}</div>
+            <div className="font-semibold text-xs">{l==='GM3'?(bd?<MarginBadge v={bd.gm3Pct}/>:<span className="text-gray-300">—</span>):v}</div>
+          </div>
+        ))}
+      </div>
+      {consP&&<div className="text-center text-xs text-gray-400 mt-1.5">{eur(consP/sub.weight)}/kg incl.</div>}
+      <div className="mt-2 pt-2 border-t border-gray-100">
+        <PriceListSubToggle prod={prod} sub={sub} compact/>
+      </div>
+    </div>
+  </div>;
+}
+
+// ── PRODUCT DETAIL ─────────────────────────────────────────────────────────
+function ProductDetail(){
+  const {state,dispatch}=useApp();
+  const prod=state.products.find(p=>p.id===state.selProdId);
+  const [selSubId,setSelSubId]=useState(null);
+  const [editSub,setEditSub]=useState(null);
+  const [editBase,setEditBase]=useState(false);
+  const [draft,setDraft]=useState(null);
+
+  useEffect(()=>{
+    if(prod&&!selSubId&&prod.subproducts.length>0) setSelSubId(prod.subproducts[0].id);
+  },[prod?.id]);
+
+  if(!prod) return <div className="text-gray-400">Niet gevonden.</div>;
+  const selSub=prod.subproducts.find(s=>s.id===selSubId);
+
+  const saveBase=()=>{ dispatch({type:'UPD_PROD',id:prod.id,data:draft}); setEditBase(false); };
+  const delSub=sid=>{ if(confirm('Variant verwijderen?')){dispatch({type:'DEL_SUB',pid:prod.id,sid}); if(selSubId===sid) setSelSubId(prod.subproducts.find(s=>s.id!==sid)?.id??null);} };
+
+  return <div className="space-y-5">
+    <div className="bg-white rounded-xl border border-gray-200 p-5">
+      {editBase?<div className="space-y-4">
+        <div><label className="block text-sm font-medium text-gray-700 mb-1">Productnaam</label>
+          <input className="inp max-w-sm w-full" value={draft.name} onChange={e=>setDraft(p=>({...p,name:e.target.value}))} autoFocus/></div>
+        <div><label className="block text-sm font-medium text-gray-700 mb-2">Diersoort</label>
+          <MultiToggle options={ANIMAL_TYPES} selected={draft.animalTypes} onChange={v=>setDraft(p=>({...p,animalTypes:v}))}/></div>
+        <div><label className="block text-sm font-medium text-gray-700 mb-2">Type product</label>
+          <MultiToggle options={PRODUCT_TYPES} selected={draft.productTypes} onChange={v=>setDraft(p=>({...p,productTypes:v}))}/></div>
+        <div className="flex gap-3">
+          <button type="button" onClick={saveBase} className="px-4 py-2 bg-green-700 text-white rounded-lg text-sm hover:bg-green-800">Opslaan</button>
+          <button type="button" onClick={()=>setEditBase(false)} className="px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">Annuleren</button>
+        </div>
+      </div>:<div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">{prod.name||<span className="text-gray-400 italic">Naamloos</span>}</h1>
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {prod.animalTypes.map(t=><Badge key={t} color="gray">{t}</Badge>)}
+            {prod.productTypes.map(t=><Badge key={t} color="blue">{t}</Badge>)}
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <button type="button" onClick={()=>{setDraft({name:prod.name,animalTypes:[...prod.animalTypes],productTypes:[...prod.productTypes]});setEditBase(true);}} className="px-3 py-1.5 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">✏️ Bewerken</button>
+          <button type="button" onClick={()=>dispatch({type:'DUP_PROD',id:prod.id})} className="px-3 py-1.5 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">⧉ Dupliceren</button>
+          <button type="button" onClick={()=>{if(confirm('Verwijderen?'))dispatch({type:'DEL_PROD',id:prod.id});}} className="px-3 py-1.5 bg-red-600 text-white rounded-lg text-sm hover:bg-red-700">🗑</button>
+        </div>
+      </div>}
+    </div>
+
+    <div className="grid grid-cols-3 gap-4">
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="font-semibold text-gray-800">Varianten</h2>
+          <button type="button" onClick={()=>setEditSub('new')} className="p-1.5 text-green-700 hover:bg-green-50 rounded-lg font-bold">＋</button>
+        </div>
+        {prod.subproducts.length===0&&<div className="text-sm text-gray-400 text-center py-8 bg-gray-50 rounded-lg">
+          Nog geen varianten.<br/><button type="button" onClick={()=>setEditSub('new')} className="mt-1 text-green-700 hover:underline text-xs">+ Toevoegen</button>
+        </div>}
+        {prod.subproducts.map(s=><SubCard key={s.id} prod={prod} sub={s}
+          selected={s.id===selSubId} onSelect={()=>setSelSubId(s.id)}
+          onEdit={()=>setEditSub(s)} onDelete={()=>delSub(s.id)}
+          onDuplicate={()=>{dispatch({type:'DUP_SUB',pid:prod.id,sid:s.id});}}/>)}
+      </div>
+      <div className="col-span-2">
+        {selSub?<PricingPanel prod={prod} sub={selSub}/>:
+          <div className="bg-white rounded-xl border border-gray-200 flex items-center justify-center h-48 text-gray-400">Selecteer een variant</div>}
+      </div>
+    </div>
+
+    {editSub&&<SubproductForm prodId={prod.id} existing={editSub==='new'?null:editSub} onClose={()=>setEditSub(null)}/>}
+  </div>;
+}
+
+// ── PRODUCTS LIST ──────────────────────────────────────────────────────────
+function ProductRow({product}){
+  const {state,dispatch}=useApp();
+  const firstSub=product.subproducts[0];
+  const minP=firstSub?calcMinPrice(firstSub,'consumenten',state.config,state.config.segments.consumenten.targetMarginMin):null;
+  let bestGm3=null;
+  for(const s of product.subproducts){
+    const cp=s.segments.consumenten.chosenPriceInclBtw;
+    if(cp){const bd=calcBreakdown(s,'consumenten',state.config,cp); if(bd&&(bestGm3===null||bd.gm3Pct>bestGm3)) bestGm3=bd.gm3Pct;}
+  }
+  return <tr className="border-t border-gray-100 hover:bg-gray-50 cursor-pointer"
+    onClick={()=>dispatch({type:'NAV',page:'product-detail',pid:product.id})}>
+    <td className="px-4 py-3">
+      <div className="font-medium text-gray-900">{product.name||<span className="text-gray-400 italic">Naamloos</span>}</div>
+      <div className="text-xs text-gray-400">{product.subproducts.length} variant{product.subproducts.length!==1?'en':''}</div>
+    </td>
+    <td className="px-4 py-3"><div className="flex flex-wrap gap-1">{product.animalTypes.map(t=><Badge key={t} color="gray">{t}</Badge>)}</div></td>
+    <td className="px-4 py-3"><div className="flex flex-wrap gap-1">{product.productTypes.map(t=><Badge key={t} color="blue">{t}</Badge>)}</div></td>
+    <td className="px-4 py-3 text-sm font-mono">{minP?eur(minP.priceIncl):'—'}</td>
+    <td className="px-4 py-3">{bestGm3!=null?<MarginBadge v={bestGm3}/>:<span className="text-xs text-gray-300">—</span>}</td>
+    <td className="px-4 py-3 text-right" onClick={e=>e.stopPropagation()}>
+      <button type="button" title="Dupliceren" onClick={()=>dispatch({type:'DUP_PROD',id:product.id})} className="text-gray-300 hover:text-green-600 p-1 mr-1" title="Kopieer">⧉</button>
+      <button type="button" onClick={()=>{if(confirm('Verwijderen?'))dispatch({type:'DEL_PROD',id:product.id});}} className="text-gray-300 hover:text-red-500 p-1">🗑</button>
+    </td>
+  </tr>;
+}
+
+function Products(){
+  const {state,dispatch}=useApp();
+  const [q,setQ]=useState('');
+  const [fA,setFA]=useState([]);
+  const [fT,setFT]=useState([]);
+  const [showFilters,setShowFilters]=useState(false);
+  const [newName,setNewName]=useState('');
+  const [showNew,setShowNew]=useState(false);
+
+  const list=useMemo(()=>state.products.filter(p=>{
+    if(q&&!p.name.toLowerCase().includes(q.toLowerCase())) return false;
+    if(fA.length&&!fA.some(a=>p.animalTypes.includes(a))) return false;
+    if(fT.length&&!fT.some(t=>p.productTypes.includes(t))) return false;
+    return true;
+  }),[state.products,q,fA,fT]);
+
+  const create=()=>{
+    if(!newName.trim()) return;
+    const id=crypto.randomUUID();
+    dispatch({type:'ADD_PROD',data:{id,name:newName}});
+    dispatch({type:'NAV',page:'product-detail',pid:id});
+    setNewName(''); setShowNew(false);
+  };
+
+  return <div className="space-y-5">
+    <div className="flex items-center justify-between">
+      <div><h1 className="text-2xl font-bold text-gray-900">Producten</h1>
+        <p className="text-sm text-gray-400 mt-0.5">{state.products.length} producten</p></div>
+      <button type="button" onClick={()=>setShowNew(true)} className="px-4 py-2 bg-green-700 text-white rounded-lg text-sm hover:bg-green-800">＋ Nieuw product</button>
+    </div>
+
+    <div className="flex items-center gap-3">
+      <div className="relative flex-1 max-w-xs">
+        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm">🔍</span>
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Zoek op naam…" className="inp w-full pl-9"/>
+        {q&&<button type="button" onClick={()=>setQ('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400">✕</button>}
+      </div>
+      <button type="button" onClick={()=>setShowFilters(x=>!x)}
+        className={`px-3 py-1.5 border rounded-lg text-sm flex items-center gap-2 transition-colors ${fA.length+fT.length?'border-green-500 text-green-700 bg-green-50':'border-gray-300 text-gray-600 hover:bg-gray-50'}`}>
+        ⚙ Filteren {(fA.length+fT.length)>0&&<Badge color="green">{fA.length+fT.length}</Badge>}
+      </button>
+      {(fA.length+fT.length)>0&&<button type="button" onClick={()=>{setFA([]);setFT([]);}} className="text-sm text-gray-400 hover:underline">Wis</button>}
+    </div>
+
+    {showFilters&&<div className="bg-white rounded-xl border border-gray-200 p-4 space-y-4 fade">
+      <div><div className="text-xs font-medium text-gray-500 mb-2">Diersoort</div><MultiToggle small options={ANIMAL_TYPES} selected={fA} onChange={setFA}/></div>
+      <div><div className="text-xs font-medium text-gray-500 mb-2">Type product</div><MultiToggle small options={PRODUCT_TYPES} selected={fT} onChange={setFT}/></div>
+    </div>}
+
+    {showNew&&<div className="bg-white rounded-xl border border-gray-200 p-4 flex items-center gap-3 fade">
+      <input className="inp flex-1 max-w-sm" placeholder="Naam nieuw product" value={newName}
+        onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==='Enter'&&create()} autoFocus/>
+      <button type="button" onClick={create} className="px-4 py-2 bg-green-700 text-white rounded-lg text-sm">Aanmaken</button>
+      <button type="button" onClick={()=>{setShowNew(false);setNewName('');}} className="px-3 py-2 border border-gray-300 rounded-lg text-sm">Annuleren</button>
+    </div>}
+
+    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50">
+          <tr>{['Product','Diersoort','Type','Min. prijs (C)','Best GM3 (C)',''].map(h=>(
+            <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
+          ))}</tr>
+        </thead>
+        <tbody>
+          {list.length===0&&<tr><td colSpan={6} className="text-center text-gray-400 py-12">Geen producten gevonden</td></tr>}
+          {list.map(p=><ProductRow key={p.id} product={p}/>)}
+        </tbody>
+      </table>
+    </div>
+  </div>;
+}
+
+// ── COST CONFIG ────────────────────────────────────────────────────────────
+function ConfigField({label,val,onChange,pre,suf,step='0.01'}){
+  return <div>
+    <label className="block text-xs font-medium text-gray-600 mb-1">{label}</label>
+    <div className="flex items-center gap-1.5">
+      {pre&&<span className="text-gray-400 text-sm">{pre}</span>}
+      <input type="number" step={step} min="0" value={val??0}
+        onChange={e=>onChange(e.target.value===''?0:parseFloat(e.target.value)||0)}
+        className="inp w-28"/>
+      {suf&&<span className="text-gray-400 text-sm">{suf}</span>}
+    </div>
+  </div>;
+}
+
+function CostConfig(){
+  const {state,dispatch}=useApp();
+  const cfg=state.config;
+  const setPath=(path,val)=>{
+    const parts=path.split('.');
+    const build=(obj,keys,v)=>{ if(!keys.length) return v; const [h,...t]=keys; return {...(obj||{}),[h]:build((obj||{})[h],t,v)}; };
+    dispatch({type:'UPD_CFG',data:build({},parts,val)});
+  };
+
+  const exportJson=()=>{
+    const data=JSON.stringify({version:1,exportedAt:new Date().toISOString(),products:state.products,config:state.config},null,2);
+    const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([data],{type:'application/json'}));
+    a.download=`predetarier-${new Date().toISOString().split('T')[0]}.json`; a.click();
+  };
+  const importJson=()=>{
+    const inp=document.createElement('input'); inp.type='file'; inp.accept='.json';
+    inp.onchange=async e=>{const t=await e.target.files[0].text(); const d=JSON.parse(t); dispatch({type:'IMPORT',products:d.products,config:d.config}); alert('Geïmporteerd!');};
+    inp.click();
+  };
+  // ── Kolom-definitie ─────────────────────────────────────────────────────
+  const XCOLS = [
+    'product_id','product_naam','diersoort','product_type',
+    'variant_id','variant_naam',
+    'leverancier_naam','inkoop_prijs','inkoop_eenheid','gewicht_kg','btw_pct',
+    'actieve_kanalen','prijslijst_kanalen',
+    'verpakking_cons','kosten_uit_cons','prijs_cons_incl_btw',
+    'verpakking_retail','kosten_uit_retail','prijs_retail_excl_btw',
+    'verpakking_horeca','kosten_uit_horeca','prijs_horeca_excl_btw'
+  ];
+
+  // ── Export (huidige data → Excel) ────────────────────────────────────────
+  const excelExport=()=>{
+    if(!window.XLSX){alert('XLSX niet geladen');return;}
+    const rows=[XCOLS];
+    for(const p of state.products){
+      for(const s of p.subproducts){
+        const sup=(s.suppliers||[]).find(x=>x.active)||(s.suppliers||[])[0]||{};
+        const dc=seg=>((s.segments[seg]?.disabledCosts)||[]).join(',');
+        rows.push([
+          p.id, p.name,
+          (p.animalTypes||[]).join(','),
+          (p.productTypes||[]).join(','),
+          s.id, s.name,
+          sup.name||'', sup.pricePerUnit??s.purchasePricePerUnit, sup.unit||s.purchaseUnit||'kg',
+          s.weight, s.vatPercent,
+          (s.activeSegments||SEGS).join(','),
+          (s.priceListSegments||[]).join(','),
+          s.segments.consumenten?.packagingType||'kopkaart', dc('consumenten'),
+          s.segments.consumenten?.chosenPriceInclBtw||'',
+          s.segments.retail?.packagingType||'wikkel', dc('retail'),
+          s.segments.retail?.chosenPriceInclBtw||'',    // excl. BTW
+          s.segments.horeca?.packagingType||'sticker', dc('horeca'),
+          s.segments.horeca?.chosenPriceInclBtw||''     // excl. BTW
+        ]);
+      }
+    }
+    const ws=XLSX.utils.aoa_to_sheet(rows);
+    // Breedte hints
+    ws['!cols']=XCOLS.map((_,i)=>({wch:i<4?20:i<6?18:14}));
+    const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,'Producten');
+    XLSX.writeFile(wb,`predetarier-producten-${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
+  // ── Import (Excel → merge met bestaande data) ────────────────────────────
+  const excelImport=()=>{
+    if(!window.XLSX){alert('XLSX niet geladen');return;}
+    const inp=document.createElement('input'); inp.type='file'; inp.accept='.xlsx,.xls,.csv';
+    inp.onchange=async e=>{
+      const buf=await e.target.files[0].arrayBuffer();
+      const wb=XLSX.read(buf); const ws=wb.Sheets[wb.SheetNames[0]];
+      const rows=XLSX.utils.sheet_to_json(ws,{defval:''});
+
+      // Deep-clone huidige producten
+      const result=JSON.parse(JSON.stringify(state.products));
+      let created=0, updated=0;
+
+      for(const r of rows){
+        if(!r.product_naam) continue;
+        const split=v=>String(v||'').split(',').map(x=>x.trim()).filter(Boolean);
+        const num=v=>v===''||v==null?null:parseFloat(v)||0;
+
+        // Zoek product op id of naam
+        let prod=result.find(p=>p.id===r.product_id||p.name===r.product_naam);
+        if(!prod){
+          prod={id:r.product_id||crypto.randomUUID(),name:r.product_naam,animalTypes:[],productTypes:[],subproducts:[],priceListSegments:[]};
+          result.push(prod); created++;
+        } else { updated++; }
+
+        // Productveldenupdate
+        if(r.product_naam) prod.name=r.product_naam;
+        if(r.diersoort) prod.animalTypes=split(r.diersoort);
+        if(r.product_type) prod.productTypes=split(r.product_type);
+
+        if(!r.variant_naam) continue;
+
+        // Zoek variant op id of naam
+        let sub=prod.subproducts.find(s=>s.id===r.variant_id||s.name===r.variant_naam);
+        const isNew=!sub;
+        if(!sub){
+          sub={...mkSub(),id:r.variant_id||crypto.randomUUID()};
+          prod.subproducts.push(sub);
+        }
+
+        // Variantveldenupdate
+        sub.name=r.variant_naam||sub.name;
+        if(r.gewicht_kg!=='') sub.weight=+r.gewicht_kg||sub.weight;
+        if(r.btw_pct!=='') sub.vatPercent=+r.btw_pct||sub.vatPercent;
+        if(r.actieve_kanalen) sub.activeSegments=split(r.actieve_kanalen);
+        if(r.prijslijst_kanalen!==undefined) sub.priceListSegments=split(r.prijslijst_kanalen);
+
+        // Leverancier
+        if(r.leverancier_naam||r.inkoop_prijs!==''){
+          const supIdx=(sub.suppliers||[]).findIndex(s=>s.active);
+          const sup={id:(sub.suppliers||[])[supIdx]?.id||crypto.randomUUID(),
+            name:r.leverancier_naam||'',pricePerUnit:num(r.inkoop_prijs)??0,
+            unit:r.inkoop_eenheid||'kg',active:true};
+          if(supIdx>=0) sub.suppliers[supIdx]=sup; else sub.suppliers=[sup];
+          sub.purchasePricePerUnit=sup.pricePerUnit; sub.purchaseUnit=sup.unit;
+        }
+
+        // Segmenten
+        const segMap={
+          consumenten:['verpakking_cons','kosten_uit_cons','prijs_cons_incl_btw'],
+          retail:     ['verpakking_retail','kosten_uit_retail','prijs_retail_excl_btw'],
+          horeca:     ['verpakking_horeca','kosten_uit_horeca','prijs_horeca_excl_btw'],
+        };
+        for(const [seg,[pkgCol,dcCol,priceCol]] of Object.entries(segMap)){
+          if(!sub.segments[seg]) sub.segments[seg]={packagingType:'kopkaart',chosenPriceInclBtw:null,disabledCosts:[]};
+          if(r[pkgCol]) sub.segments[seg].packagingType=r[pkgCol];
+          if(r[dcCol]!==undefined) sub.segments[seg].disabledCosts=split(r[dcCol]);
+          if(r[priceCol]!=='') sub.segments[seg].chosenPriceInclBtw=num(r[priceCol]);
+          if(!sub.segments.consumenten.competitorPrices) sub.segments.consumenten.competitorPrices=[];
+        }
+      }
+
+      dispatch({type:'IMPORT',products:result});
+      alert(`Klaar. ${created} nieuwe producten aangemaakt, ${updated} bestaande bijgewerkt.`);
+    };
+    inp.click();
+  };
+
+  const F = ConfigField;
+
+  return <div className="space-y-5">
+    <div><h1 className="text-2xl font-bold text-gray-900">Kostenconfiguratie</h1>
+      <p className="text-sm text-gray-400 mt-0.5">Wijzigingen worden direct opgeslagen.</p></div>
+
+    <Card title="Verpakkingskosten">
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+        {Object.entries(PKG_LABELS).map(([k,l])=><F key={k} label={l} val={cfg.costs.packaging[k]??0} onChange={v=>setPath(`costs.packaging.${k}`,v)} pre="€"/>)}
+      </div>
+    </Card>
+
+    <Card title="Algemene kosten & handlingstijden">
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+        <F label="Uurtarief handling" val={cfg.costs.handlingHourlyRate} onChange={v=>setPath('costs.handlingHourlyRate',v)} pre="€" suf="/uur"/>
+        <F label="Transactiekosten" val={cfg.costs.transactionCostPercent} onChange={v=>setPath('costs.transactionCostPercent',v)} suf="%" step="0.1"/>
+        <F label="Opslagkosten" val={cfg.costs.storageCostPerUnit} onChange={v=>setPath('costs.storageCostPerUnit',v)} pre="€" suf="/eenheid"/>
+      </div>
+      <div>
+        <h3 className="text-sm font-medium text-gray-700 mb-3">Handlingstijden per segment (minuten)</h3>
+        <div className="overflow-hidden rounded-lg border border-gray-200">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Segment</th>
+                <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Labeling → GM2</th>
+                <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Verzending → GM3</th>
+              </tr>
+            </thead>
+            <tbody>
+              {SEGS.map(seg => {
+                const hm = cfg.costs.handlingMinutes?.[seg] ?? {};
+                const lab = typeof hm === 'object' ? (hm.labeling??0) : hm;
+                const verz = typeof hm === 'object' ? (hm.verzending??0) : 0;
+                return <tr key={seg} className="border-t border-gray-100">
+                  <td className="px-4 py-2 font-medium text-gray-700">{SEG_LABELS[seg]}</td>
+                  <td className="px-4 py-2">
+                    <div className="flex items-center gap-1.5">
+                      <input type="number" step="0.5" min="0" value={lab}
+                        onChange={e=>setPath(`costs.handlingMinutes.${seg}.labeling`, parseFloat(e.target.value)||0)}
+                        className="inp w-20"/>
+                      <span className="text-gray-400 text-xs">min.</span>
+                    </div>
+                  </td>
+                  <td className="px-4 py-2">
+                    <div className="flex items-center gap-1.5">
+                      <input type="number" step="0.5" min="0" value={verz}
+                        onChange={e=>setPath(`costs.handlingMinutes.${seg}.verzending`, parseFloat(e.target.value)||0)}
+                        className="inp w-20"/>
+                      <span className="text-gray-400 text-xs">min.</span>
+                    </div>
+                  </td>
+                </tr>;
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p className="text-xs text-gray-400 mt-1.5">Beide typen gebruiken hetzelfde uurtarief (€ {fmt(cfg.costs.handlingHourlyRate,0)}/uur).</p>
+      </div>
+    </Card>
+
+    <Card title="Instellingen per segment">
+      {SEGS.map(sk=>{
+        const s=cfg.segments[sk];
+        return <div key={sk} className="bg-gray-50 rounded-lg p-4">
+          <h3 className="font-medium text-sm text-gray-800 mb-3">{SEG_LABELS[sk]}</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            <F label="Gem. orderwaarde" val={s.avgOrderValue} onChange={v=>setPath(`segments.${sk}.avgOrderValue`,v)} pre="€"/>
+            <F label="Gratis verzending vanaf" val={s.freeShippingFrom} onChange={v=>setPath(`segments.${sk}.freeShippingFrom`,v)} pre="€"/>
+            <F label="Verzendkosten" val={s.shippingCost} onChange={v=>setPath(`segments.${sk}.shippingCost`,v)} pre="€"/>
+            <F label="Bezorgfee" val={s.deliveryFee??0} onChange={v=>setPath(`segments.${sk}.deliveryFee`,v)} pre="€"/>
+
+            {sk==='consumenten'&&<F label="Min. marge (GM3)" val={(s.targetMarginMin*100).toFixed(1)} onChange={v=>setPath(`segments.${sk}.targetMarginMin`,v/100)} suf="%"/>}
+            {sk==='retail'&&<><F label="Retailer marge" val={(s.retailerMargin*100).toFixed(1)} onChange={v=>setPath(`segments.${sk}.retailerMargin`,v/100)} suf="%"/>
+              <F label="Min. eigen marge" val={(s.minOwnMargin*100).toFixed(1)} onChange={v=>setPath(`segments.${sk}.minOwnMargin`,v/100)} suf="%"/></>}
+            {sk==='horeca'&&<F label="Doelmarge (GM3)" val={(s.targetMargin*100).toFixed(1)} onChange={v=>setPath(`segments.${sk}.targetMargin`,v/100)} suf="%"/>}
+          </div>
+          {/* Gratis-verzending indicator */}
+          {(()=>{
+            const gratis=s.freeShippingFrom>0&&s.avgOrderValue>=s.freeShippingFrom;
+            return <div className={`mt-3 flex items-center gap-2 px-3 py-2 rounded-lg text-xs ${gratis?'bg-green-50 text-green-700':'bg-orange-50 text-orange-700'}`}>
+              <span>{gratis?'✓':'⚠'}</span>
+              <span>
+                Gem. orderwaarde <strong>{eur(s.avgOrderValue,0)}</strong> is{' '}
+                {gratis?'boven':'onder'} gratis-verzenddrempel <strong>{eur(s.freeShippingFrom,0)}</strong>
+                {' '}→ verzendkosten worden <strong>{gratis?'niet':'wél'}</strong> toegerekend
+              </span>
+            </div>;
+          })()}
+        </div>;
+      })}
+    </Card>
+
+    <Card title="Back-up & Import/Export">
+      <div className="space-y-4">
+        <div>
+          <p className="text-sm font-medium text-gray-700 mb-3">Handmatige back-up (JSON)</p>
+          <div className="flex gap-3">
+            <button type="button" onClick={exportJson} className="px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">⬇ Exporteer JSON</button>
+            <button type="button" onClick={importJson} className="px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">⬆ Importeer JSON</button>
+          </div>
+        </div>
+        <div>
+          <p className="text-sm font-medium text-gray-700 mb-1">Bulk bewerken (Excel)</p>
+          <p className="text-xs text-gray-400 mb-3">Exporteer alle producten, pas aan in Excel, en importeer terug. Bestaande producten worden overschreven op basis van naam.</p>
+          <div className="flex gap-3 flex-wrap">
+            <button type="button" onClick={excelExport} className="px-3 py-2 bg-green-700 text-white rounded-lg text-sm hover:bg-green-800 flex items-center gap-2">⬇ Exporteer alle producten</button>
+            <button type="button" onClick={excelImport} className="px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50 flex items-center gap-2">⬆ Importeer & overschrijf</button>
+          </div>
+        </div>
+        <GoogleDriveSection/>
+      </div>
+    </Card>
+  </div>;
+}
+
+function GoogleDriveSection(){
+  const {state,dispatch}=useApp();
+  const [status,setStatus]=useState('');
+  const [connected,setConnected]=useState(false);
+  const tokenRef=useRef(null);
+  const clientRef=useRef(null);
+  const connect=async()=>{
+    const cid=state.config.googleDrive?.clientId;
+    if(!cid){setStatus('Voer eerst een Client ID in.');return;}
+    const init=cid=>{
+      clientRef.current=window.google?.accounts.oauth2.initTokenClient({client_id:cid,scope:'https://www.googleapis.com/auth/drive.file',callback:r=>{if(r.access_token){tokenRef.current=r.access_token;setConnected(true);setStatus('Verbonden ✓');}}});
+      clientRef.current?.requestAccessToken({prompt:''});
+    };
+    if(!window.google){const s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.onload=()=>init(cid);s.onerror=()=>setStatus('GSI laden mislukt');document.head.appendChild(s);}
+    else init(cid);
+  };
+  const backup=async()=>{
+    if(!tokenRef.current){setStatus('Niet verbonden.');return;}
+    setStatus('Uploaden…');
+    try{
+      const json=JSON.stringify({version:1,exportedAt:new Date().toISOString(),products:state.products,config:state.config},null,2);
+      const fn='predetarier-pricing-backup.json';
+      const sr=await fetch(`https://www.googleapis.com/drive/v3/files?q=name='${fn}'`,{headers:{Authorization:`Bearer ${tokenRef.current}`}});
+      const sd=await sr.json(); const ex=sd.files?.[0];
+      const fm=new FormData();
+      fm.append('metadata',new Blob([JSON.stringify({name:fn,mimeType:'application/json'})],{type:'application/json'}));
+      fm.append('file',new Blob([json],{type:'application/json'}));
+      const url=ex?`https://www.googleapis.com/upload/drive/v3/files/${ex.id}?uploadType=multipart`:'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
+      const r=await fetch(url,{method:ex?'PATCH':'POST',headers:{Authorization:`Bearer ${tokenRef.current}`},body:fm});
+      if(!r.ok) throw new Error(r.status);
+      const now=new Date().toISOString();
+      dispatch({type:'UPD_CFG',data:{googleDrive:{lastBackup:now}}});
+      setStatus(`Back-up geslaagd: ${new Date(now).toLocaleString('nl-NL')}`);
+    }catch(e){setStatus(`Fout: ${e.message}`);}
+  };
+  return <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+    <p className="text-sm font-medium text-gray-800 mb-3">☁ Google Drive back-up</p>
+    <div className="mb-3">
+      <label className="block text-xs font-medium text-gray-600 mb-1">OAuth2 Client ID
+        <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener" className="ml-2 text-blue-600 hover:underline font-normal">→ Google Cloud Console</a>
+      </label>
+      <input type="text" value={state.config.googleDrive?.clientId??''}
+        onChange={e=>dispatch({type:'UPD_CFG',data:{googleDrive:{clientId:e.target.value}}})}
+        className="inp w-full max-w-lg" placeholder="xxxx.apps.googleusercontent.com"/>
+    </div>
+    <div className="flex flex-wrap gap-3 items-center">
+      <button type="button" onClick={connect} className={`px-3 py-2 border rounded-lg text-sm ${connected?'border-green-500 text-green-700 bg-green-50':'border-gray-300 hover:bg-gray-50'}`}>
+        {connected?'✓ Verbonden':'☁ Verbinden'}
+      </button>
+      {connected&&<button type="button" onClick={backup} className="px-3 py-2 bg-green-700 text-white rounded-lg text-sm hover:bg-green-800">⬆ Nu back-uppen</button>}
+    </div>
+    {status&&<p className="mt-2 text-sm text-gray-600">{status}</p>}
+    {state.config.googleDrive?.lastBackup&&<p className="mt-1 text-xs text-gray-400">Laatste back-up: {new Date(state.config.googleDrive.lastBackup).toLocaleString('nl-NL')}</p>}
+  </div>;
+}
+
+// ── ANALYTICS ──────────────────────────────────────────────────────────────
+function Analytics(){
+  const {state}=useApp();
+  const chartRef=useRef(null); const chartInst=useRef(null);
+
+  const data=useMemo(()=>{
+    const rows=[];
+    for(const p of state.products) for(const s of p.subproducts){
+      const row={prodName:p.name,subName:s.name,short:s.name.length>12?s.name.slice(0,12)+'…':s.name,inkoop:activePurchaseCost(s)};
+      const vatMult=1+s.vatPercent/100;
+      for(const seg of SEGS){
+        const stored=s.segments[seg]?.chosenPriceInclBtw;
+        const isB2B=seg!=='consumenten';
+        // stored = incl. BTW for cons, excl. BTW for B2B
+        let priceExcl=null, priceForCalc=null;
+        if(seg==='consumenten'){
+          priceForCalc=stored; priceExcl=stored?stored/vatMult:null;
+        } else {
+          priceExcl=stored;
+          if(!priceExcl&&seg==='horeca') priceExcl=calcMinPrice(s,'horeca',state.config,state.config.segments.horeca.targetMargin).priceExcl;
+          if(!priceExcl&&seg==='retail'){const cp=s.segments.consumenten.chosenPriceInclBtw; if(cp){const rd=calcRetailData(s,state.config,cp); priceExcl=rd?.retailPriceExcl;}}
+          priceForCalc=priceExcl?priceExcl*vatMult:null;
+        }
+        if(priceForCalc){const bd=calcBreakdown(s,seg,state.config,priceForCalc); row[`${seg}_gm3`]=bd?.gm3Pct??null; row[`${seg}_pricePerKg`]=priceExcl?priceExcl/s.weight:null;}
+      }
+      rows.push(row);
+    }
+    return rows;
+  },[state.products,state.config]);
+
+  useEffect(()=>{
+    if(!chartRef.current||!data.length) return;
+    if(chartInst.current) chartInst.current.destroy();
+    const cd=data.filter(r=>r.consumenten_gm3!=null).slice(0,15);
+    if(!cd.length) return;
+    chartInst.current=new Chart(chartRef.current,{type:'bar',
+      data:{labels:cd.map(r=>r.short),datasets:[{label:'GM3 Consumenten',data:cd.map(r=>r.consumenten_gm3*100),
+        backgroundColor:cd.map(r=>r.consumenten_gm3<0?'#ef4444':r.consumenten_gm3<0.30?'#eab308':'#22c55e'),borderRadius:4}]},
+      options:{responsive:true,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>`GM3: ${c.raw.toFixed(1)}%`}}},
+        scales:{y:{ticks:{callback:v=>`${v}%`},grid:{color:'#f0f0f0'}},x:{grid:{display:false}}}}});
+  },[data]);
+
+  const withC=data.filter(r=>r.consumenten_gm3!=null);
+  const avgGm3=withC.length?withC.reduce((a,r)=>a+r.consumenten_gm3,0)/withC.length:null;
+  const below=withC.filter(r=>r.consumenten_gm3<0.30).length;
+  const above=withC.filter(r=>r.consumenten_gm3>0.70).length;
+  const warnings=withC.filter(r=>r.consumenten_gm3<0.30||r.consumenten_gm3>0.70);
+
+  return <div className="space-y-5">
+    <div><h1 className="text-2xl font-bold text-gray-900">Analytics</h1>
+      <p className="text-sm text-gray-400 mt-0.5">Marginoverzicht over alle producten.</p></div>
+
+    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+      {[['📦','Varianten totaal',data.length,`${withC.length} met consumentenprijs`,''],
+        ['📈','Gem. GM3 (consumenten)',avgGm3!=null?pct(avgGm3):'—','',avgGm3!=null?(avgGm3<0.30?'text-red-600':'text-green-700'):''],
+        ['⚠️','Onder minimum (< 30%)',below,'consumentenprijzen',below>0?'text-red-600':'text-green-700'],
+        ['💰','Boven maximum (> 70%)',above,'mogelijk te duur','']
+      ].map(([icon,label,val,sub,col])=>(
+        <div key={label} className="bg-white rounded-xl border border-gray-200 p-4 flex items-start gap-3">
+          <div className="text-2xl">{icon}</div>
+          <div><div className="text-xs text-gray-500">{label}</div>
+            <div className={`text-xl font-bold ${col}`}>{val}</div>
+            {sub&&<div className="text-xs text-gray-400">{sub}</div>}
+          </div>
+        </div>
+      ))}
+    </div>
+
+    {data.some(r=>r.consumenten_gm3!=null)&&<div className="bg-white rounded-xl border border-gray-200 p-5">
+      <h2 className="font-semibold text-gray-800 mb-4">GM3 per variant (consumenten)</h2>
+      <canvas ref={chartRef} height="100"/>
+    </div>}
+
+    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="px-5 py-3 border-b border-gray-100"><h2 className="font-semibold text-gray-800">Margeoverzicht per segment</h2></div>
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50"><tr>
+          {['Product','Variant','Inkoop','GM3 Cons.','GM3 Retail','GM3 Horeca','€/kg C incl.'].map(h=>(
+            <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
+          ))}
+        </tr></thead>
+        <tbody>
+          {data.length===0&&<tr><td colSpan={7} className="text-center text-gray-400 py-10">Nog geen producten.</td></tr>}
+          {data.map((r,i)=><tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
+            <td className="px-4 py-3 font-medium">{r.prodName}</td>
+            <td className="px-4 py-3 text-gray-600">{r.subName}</td>
+            <td className="px-4 py-3 font-mono">{eur(r.inkoop)}</td>
+            {SEGS.map(seg=><td key={seg} className="px-4 py-3">{r[`${seg}_gm3`]!=null?<MarginBadge v={r[`${seg}_gm3`]}/>:<span className="text-gray-300">—</span>}</td>)}
+            <td className="px-4 py-3 font-mono">{r.consumenten_pricePerKg?eur(r.consumenten_pricePerKg):'—'}</td>
+          </tr>)}
+        </tbody>
+      </table>
+    </div>
+
+    {warnings.length>0&&<div className="bg-white rounded-xl border border-gray-200 p-5">
+      <h2 className="font-semibold text-gray-800 mb-3">⚠️ Waarschuwingen</h2>
+      <div className="space-y-2">
+        {warnings.map((w,i)=><div key={i} className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm ${w.consumenten_gm3<0.30?'bg-red-50 text-red-700':'bg-yellow-50 text-yellow-700'}`}>
+          ⚠️ <span><strong>{w.prodName} — {w.subName}</strong>: GM3 {pct(w.consumenten_gm3)} {w.consumenten_gm3<0.30?'onder minimum van 30%':'boven maximum van 70%'}</span>
+        </div>)}
+      </div>
+    </div>}
+  </div>;
+}
+
+// ── PRICE LIST PAGE ────────────────────────────────────────────────────────
+function PriceList(){
+  const {state}=useApp();
+  const [seg,setSeg]=useState('consumenten');
+
+  const rows=useMemo(()=>{
+    const out=[];
+    for(const p of state.products){
+      for(const s of p.subproducts){
+        if(!(s.priceListSegments||[]).includes(seg)) continue;
+        const vatMult=1+s.vatPercent/100;
+        const stored=s.segments[seg].chosenPriceInclBtw; // excl. for B2B
+        const consumerPriceIncl=s.segments.consumenten.chosenPriceInclBtw;
+        let rd=null, priceExcl=null, priceForCalc=null;
+        if(seg==='consumenten'){
+          priceForCalc=stored; priceExcl=stored?stored/vatMult:null;
+        } else {
+          priceExcl=stored;
+          if(seg==='retail'){
+            rd=consumerPriceIncl?calcRetailData(s,state.config,consumerPriceIncl):null;
+            if(!priceExcl) priceExcl=rd?.retailPriceExcl;
+          }
+          if(seg==='horeca'&&!priceExcl)
+            priceExcl=calcMinPrice(s,'horeca',state.config,state.config.segments.horeca.targetMargin).priceExcl;
+          priceForCalc=priceExcl?priceExcl*vatMult:null;
+        }
+        const bd=priceForCalc?calcBreakdown(s,seg,state.config,priceForCalc):null;
+        const variantLabel=`${s.name} (${Math.round(s.weight*1000)}g)`;
+        out.push({prod:p.name,variant:variantLabel,priceExcl,priceIncl:seg==='consumenten'?stored:null,bd,vatMult,weight:s.weight,rd,consumerPriceIncl});
+      }
+    }
+    return out;
+  },[state.products,state.config,seg]);
+
+  const segCount=s=>state.products.reduce((n,p)=>n+p.subproducts.filter(ss=>(ss.priceListSegments||[]).includes(s)).length,0);
+
+  // Segment-specific table headers & cells
+  const TH=({children,right})=><th className={`px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide ${right?'text-right':'text-left'}`}>{children}</th>;
+  const TD=({children,right,bold})=><td className={`px-4 py-3 ${right?'text-right font-mono':''}${bold?' font-semibold':''}`}>{children||'—'}</td>;
+
+  const renderHeaders=()=>{
+    if(seg==='consumenten') return <><TH>Product</TH><TH>Variant</TH><TH right>Prijs incl. BTW</TH><TH right>Kiloprijs incl. BTW</TH></>;
+    if(seg==='horeca')      return <><TH>Product</TH><TH>Variant</TH><TH right>Kiloprijs excl. BTW</TH></>;
+    if(seg==='retail')      return <><TH>Product</TH><TH>Variant</TH><TH right>Stuksprijs excl. BTW</TH><TH right>Adviesprijs incl. BTW</TH><TH right>Marge retailer</TH></>;
+  };
+  const renderRow=(r,i)=>{
+    if(seg==='consumenten') return <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
+      <TD bold>{r.prod}</TD>
+      <TD>{r.variant}</TD>
+      <TD right bold>{r.priceIncl?eur(r.priceIncl):'—'}</TD>
+      <TD right>{r.bd?eur(r.bd.pkgPerKgIncl):'—'}</TD>
+    </tr>;
+    if(seg==='horeca') return <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
+      <TD bold>{r.prod}</TD>
+      <TD>{r.variant}</TD>
+      <TD right bold>{r.priceExcl?eur(r.priceExcl/r.weight):'—'}</TD>
+    </tr>;
+    if(seg==='retail'){
+      const retailerMargin=r.rd?.retailerMarginActual;
+      return <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
+        <TD bold>{r.prod}</TD>
+        <TD>{r.variant}</TD>
+        <TD right bold>{r.priceExcl?eur(r.priceExcl):'—'}</TD>
+        <TD right>{r.consumerPriceIncl?eur(r.consumerPriceIncl):'—'}</TD>
+        <TD right>{retailerMargin!=null?pct(retailerMargin):'—'}</TD>
+      </tr>;
+    }
+  };
+
+  return <div className="space-y-5">
+    {/* ── Printlogo (alleen zichtbaar bij afdrukken) ── */}
+    <div className="hidden print:block mb-6">
+      <div style={{borderBottom:'2px solid #14532d',paddingBottom:'10px',marginBottom:'12px',display:'flex',justifyContent:'space-between',alignItems:'baseline'}}>
+        <div style={{fontFamily:'Georgia,serif',fontSize:'22px',fontWeight:'bold',color:'#14532d'}}>
+          De Predetariër
+        </div>
+        <div style={{fontSize:'12px',color:'#6b7280'}}>
+          {new Date().toLocaleDateString('nl-NL',{day:'numeric',month:'long',year:'numeric'})}
+        </div>
+      </div>
+      <div style={{fontSize:'17px',fontWeight:'600',color:'#111827'}}>Prijslijst {SEG_LABELS[seg]}</div>
+    </div>
+
+    {/* ── Schermweergave header ── */}
+    <div className="print:hidden flex items-start justify-between">
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900">Prijslijsten</h1>
+      </div>
+      <button type="button" onClick={()=>window.print()}
+        className="px-4 py-2 bg-green-700 text-white rounded-lg text-sm hover:bg-green-800">
+        🖨 Afdrukken
+      </button>
+    </div>
+
+    <div className="flex gap-2 print:hidden">
+      {SEGS.map(s=>{
+        const cnt=segCount(s);
+        return <button key={s} type="button" onClick={()=>setSeg(s)}
+          className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${seg===s?'bg-green-700 text-white border-green-700':'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'}`}>
+          {SEG_LABELS[s]}{cnt>0&&<span className={`ml-1.5 px-1.5 py-0.5 rounded-full text-xs ${seg===s?'bg-green-600 text-white':'bg-gray-100 text-gray-600'}`}>{cnt}</span>}
+        </button>;
+      })}
+    </div>
+
+    {rows.length===0?(
+      <div className="bg-white rounded-xl border border-gray-200 p-12 text-center text-gray-400">
+        <p className="text-lg mb-2">Geen producten op de {SEG_LABELS[seg]}-prijslijst</p>
+        <p className="text-sm">Ga naar een product en vink bij "Prijslijst" het segment aan.</p>
+      </div>
+    ):(
+      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50"><tr>{renderHeaders()}</tr></thead>
+          <tbody>{rows.map((r,i)=>renderRow(r,i))}</tbody>
+        </table>
+      </div>
+    )}
+  </div>;
+}
+
+// ── ROOT ───────────────────────────────────────────────────────────────────
+function Layout({children}){
+  const {state,dispatch}=useApp();
+  const nav=p=>dispatch({type:'NAV',page:p});
+  return <div className="flex h-screen bg-gray-50">
+    <aside className="w-52 bg-green-900 text-white flex flex-col shrink-0">
+      <div className="px-5 py-5 border-b border-green-800">
+        <div className="text-xs font-semibold tracking-widest text-green-400 uppercase">De Predetariër</div>
+        <div className="text-lg font-bold mt-0.5">Pricing</div>
+      </div>
+      <nav className="flex-1 py-3 px-2 space-y-0.5">
+        {[['products','📦','Producten'],['pricelist','🗒','Prijslijsten'],['analytics','📊','Analytics'],['config','⚙️','Kosten & config']].map(([id,icon,label])=>(
+          <button key={id} type="button" onClick={()=>nav(id)}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${(state.page===id||(state.page==='product-detail'&&id==='products'))?'bg-green-700 text-white':'text-green-200 hover:bg-green-800 hover:text-white'}`}  >
+            <span>{icon}</span>{label}
+          </button>
+        ))}
+      </nav>
+      <div className="px-4 py-3 border-t border-green-800 text-xs text-green-600">v0.2.0</div>
+    </aside>
+    <main className="flex-1 overflow-auto">
+      <div className="px-8 py-6 max-w-6xl mx-auto">
+        {state.page==='product-detail'&&<button type="button" onClick={()=>nav('products')} className="flex items-center gap-1 text-sm text-gray-400 hover:text-gray-700 mb-4">← Terug naar producten</button>}
+        {children}
+      </div>
+    </main>
+  </div>;
+}
+function Pages(){
+  const {state}=useApp();
+  if(state.page==='product-detail') return <ProductDetail/>;
+  if(state.page==='analytics') return <Analytics/>;
+  if(state.page==='config') return <CostConfig/>;
+  if(state.page==='pricelist') return <PriceList/>;
+  return <Products/>;
+}
+function App(){
+  return <AppProvider><Layout><Pages/></Layout></AppProvider>;
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
