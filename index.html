@@ -71,7 +71,7 @@ const mkSub = () => ({
   suppliers: [{ id: crypto.randomUUID(), name:'', pricePerUnit:0, unit:'kg', active:true }],
   purchasePricePerUnit: 0, purchaseUnit:'kg', weight:1, vatPercent:9,
   priceListSegments: [],
-  activeSegments: ['consumenten','retail','horeca'], // welke kanalen van toepassing zijn
+  activeSegments: ['consumenten','retail','horeca'],
   segments: {
     consumenten: { packagingType:'kopkaart', chosenPriceInclBtw:null, competitorPrices:[], disabledCosts:[] },
     retail:      { packagingType:'wikkel',   chosenPriceInclBtw:null, disabledCosts:[] },
@@ -215,6 +215,7 @@ function mergeDeep(base,over){
 // Migrate products: ensure subproducts have priceListSegments + normalize competitorPrices
 function migrateProducts(products){
   return (products||[]).map(p=>({
+    displayVariantId: null,
     ...p,
     subproducts: (p.subproducts||[]).map(s=>{
       const compPrices = ((s.segments?.consumenten?.competitorPrices)||[]).map((c,i)=>
@@ -225,6 +226,7 @@ function migrateProducts(products){
         priceListSegments: [],
         activeSegments: ['consumenten','retail','horeca'],
         ...s,
+        // displayVariantId zit op product-niveau, niet hier
         segments: {
           ...s.segments,
           consumenten: { disabledCosts:[], ...s.segments?.consumenten, competitorPrices: compPrices },
@@ -256,7 +258,8 @@ const useApp = () => useContext(Ctx);
 function reducer(s,a){
   switch(a.type){
     case 'NAV': return {...s,page:a.page,selProdId:a.pid??null};
-    case 'ADD_PROD': return {...s,products:[...s.products,{id:crypto.randomUUID(),name:'',animalTypes:[],productTypes:[],subproducts:[],...a.data}]};
+    case 'ADD_PROD': return {...s,products:[...s.products,{id:crypto.randomUUID(),name:'',animalTypes:[],productTypes:[],subproducts:[],displayVariantId:null,...a.data}]};
+    case 'SET_DISPLAY_VARIANT': return {...s,products:s.products.map(p=>p.id===a.pid?{...p,displayVariantId:a.sid}:p)};
     case 'UPD_PROD': return {...s,products:s.products.map(p=>p.id===a.id?{...p,...a.data}:p)};
     case 'DEL_PROD': return {...s,products:s.products.filter(p=>p.id!==a.id),page:'products'};
     case 'DUP_PROD': {
@@ -961,19 +964,26 @@ function PricingPanel({prod,sub}){
 
 // ── SUBPRODUCT CARD ────────────────────────────────────────────────────────
 function SubCard({prod,sub,selected,onSelect,onEdit,onDelete,onDuplicate}){
-  const {state}=useApp();
+  const {state,dispatch}=useApp();
   const consP=sub.segments.consumenten.chosenPriceInclBtw;
   const bd=consP?calcBreakdown(sub,'consumenten',state.config,consP):null;
   const minP=calcMinPrice(sub,'consumenten',state.config,state.config.segments.consumenten.targetMarginMin);
+  const isPinned=prod.displayVariantId===sub.id;
+  const pin=e=>{e.stopPropagation(); dispatch({type:'SET_DISPLAY_VARIANT',pid:prod.id,sid:isPinned?null:sub.id});};
   return <div onClick={onSelect}
     className={`bg-white rounded-xl border transition-all cursor-pointer ${selected?'border-green-500 ring-2 ring-green-500':'border-gray-200 hover:border-gray-300'}`}>
     <div className="p-4">
       <div className="flex items-start justify-between mb-3">
-        <div>
-          <div className="font-semibold text-gray-900 text-sm">{sub.name||<span className="text-gray-400 italic">Naamloos</span>}</div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5">
+            <div className="font-semibold text-gray-900 text-sm truncate">{sub.name||<span className="text-gray-400 italic">Naamloos</span>}</div>
+            {isPinned&&<span title="Getoond in overzicht" className="text-amber-500 text-xs shrink-0">📌</span>}
+          </div>
           <div className="text-xs text-gray-400 mt-0.5">{eur(activePurchaseCost(sub))} inkoop • {Math.round(sub.weight*1000)}g</div>
         </div>
-        <div className="flex gap-0.5" onClick={e=>e.stopPropagation()}>
+        <div className="flex gap-0.5 shrink-0" onClick={e=>e.stopPropagation()}>
+          <button type="button" title={isPinned?'Pinnen ongedaan maken':'Toon in overzicht'} onClick={pin}
+            className={`p-1 rounded text-sm ${isPinned?'text-amber-500 hover:text-amber-600':'text-gray-300 hover:text-amber-400'}`}>📌</button>
           <button type="button" title="Bewerken" onClick={onEdit} className="p-1 text-gray-400 hover:text-gray-700 rounded text-sm">✏️</button>
           <button type="button" title="Dupliceren" onClick={onDuplicate} className="p-1 text-gray-400 hover:text-green-600 rounded text-sm">⧉</button>
           <button type="button" title="Verwijderen" onClick={onDelete} className="p-1 text-gray-400 hover:text-red-500 rounded text-sm">🗑</button>
@@ -1070,21 +1080,19 @@ function ProductDetail(){
 // ── PRODUCTS LIST ──────────────────────────────────────────────────────────
 function ProductRow({product}){
   const {state,dispatch}=useApp();
-  // Gebruik de eerste variant met een ingestelde consumentenprijs; anders de eerste variant
-  const subWithPrice = product.subproducts.find(s=>s.segments.consumenten.chosenPriceInclBtw) || product.subproducts[0];
-  let stuksprijs=null, kiloprijs=null, bestGm2=null, bestGm3=null;
-  for(const s of product.subproducts){
-    const cp=s.segments.consumenten.chosenPriceInclBtw;
-    if(cp){
-      const bd=calcBreakdown(s,'consumenten',state.config,cp);
-      if(bd){
-        if(bestGm3===null||bd.gm3Pct>bestGm3){
-          bestGm3=bd.gm3Pct; bestGm2=bd.gm2Pct;
-          stuksprijs=cp;
-          kiloprijs=bd.pkgPerKgIncl;
-        }
-      }
+  // Gebruik gepinde variant; daarna de variant met hoogste GM3
+  let displaySub = product.subproducts.find(s=>s.id===product.displayVariantId);
+  if(!displaySub) {
+    let bestGm3Tmp=null;
+    for(const s of product.subproducts){
+      const cp=s.segments.consumenten.chosenPriceInclBtw;
+      if(cp){ const bd=calcBreakdown(s,'consumenten',state.config,cp); if(bd&&(bestGm3Tmp===null||bd.gm3Pct>bestGm3Tmp)){bestGm3Tmp=bd.gm3Pct; displaySub=s;} }
     }
+  }
+  let stuksprijs=null, kiloprijs=null, bestGm2=null, bestGm3=null;
+  if(displaySub){
+    const cp=displaySub.segments.consumenten.chosenPriceInclBtw;
+    if(cp){ const bd=calcBreakdown(displaySub,'consumenten',state.config,cp); if(bd){ stuksprijs=cp; kiloprijs=bd.pkgPerKgIncl; bestGm2=bd.gm2Pct; bestGm3=bd.gm3Pct; } }
   }
   return <tr className="border-t border-gray-100 hover:bg-gray-50 cursor-pointer"
     onClick={()=>dispatch({type:'NAV',page:'product-detail',pid:product.id})}>
